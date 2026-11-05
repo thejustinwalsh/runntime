@@ -523,23 +523,46 @@ describe('Conv1d and ConvTranspose1d with a quantized weight', () => {
   });
 
   it.each([
-    {
-      name: 'kernel·in that is not a multiple of 8',
-      layer: () => new Conv1d(4, 4, 3),
-      file: () => quantCheckpoint(8, 12, { weight: zeros(4, 12, 1) }),
-      error: /needs in a multiple of 4 and 3·in of 8, got in 4/,
-    },
-    {
-      name: 'in that is not a multiple of 4',
-      layer: () => new Conv1d(2, 4, 4),
-      file: () => quantCheckpoint(8, 8, { weight: zeros(4, 8, 1) }),
-      error: /needs in a multiple of 4 and 4·in of 8, got in 2/,
-    },
+    { name: 'one input channel', cIn: 1, kernel: 3 },
+    { name: 'kernel·in that is not a multiple of 8', cIn: 4, kernel: 3 },
+    { name: 'in that is not a multiple of 4', cIn: 2, kernel: 4 },
+  ])('loads a Conv1d weight on $name as its dequantized floats', async ({ cIn, kernel }) => {
+    // One scale per output row, 0.5 and 0.25; ints 1, 2, … and −1, −2, …
+    const cols = cIn * kernel;
+    const ints = Array.from({ length: 2 * cols }, (_, i) => (i < cols ? i + 1 : cols - i - 1));
+    const layer = new Conv1d(cIn, 2, kernel, { bias: false });
+    const sd = await quantCheckpoint(8, cols, {
+      weight: { ints, scales: [0.5, 0.25], shape: [2, cols] },
+    });
+    layer.transformStateDict(sd, '');
+    expect(shapes(layer)).toEqual({ weight: meta([cols, 2]) });
+    // tap-major [kernel·in, out]: row tap·in + c holds both outputs' (c, tap)
+    const want = Array.from({ length: 2 * cols }, (_, i) => {
+      const [row, o] = [Math.floor(i / 2), i % 2];
+      const [tap, c] = [Math.floor(row / cIn), row % cIn];
+      return ints[o * cols + c * kernel + tap]! * (o === 0 ? 0.5 : 0.25);
+    });
+    expect([...(await sd.tensors.get('weight')!.f32())]).toEqual(want);
+  });
+
+  it.each([
     {
       name: 'a ConvTranspose1d weight in Conv1d layout',
       layer: () => new ConvTranspose1d(16, 8, 4, { stride: 2 }),
       file: () => quantCheckpoint(8, 8, { weight: zeros(8, 64, 8) }),
       error: /expected \[in, out·kernel\] = \[16, 32\]/,
+    },
+    {
+      name: 'a ConvTranspose1d weight with taps·in that is not a multiple of 8',
+      layer: () => new ConvTranspose1d(4, 4, 6, { stride: 2 }),
+      file: () => quantCheckpoint(8, 24, { weight: zeros(4, 24, 1) }),
+      error: /needs in a multiple of 4 and 3·in of 8, got in 4/,
+    },
+    {
+      name: 'a weight of another shape on one input channel',
+      layer: () => new Conv1d(1, 4, 3),
+      file: () => quantCheckpoint(8, 4, { weight: zeros(3, 4, 1) }),
+      error: /expected \[out, in·kernel\] = \[4, 3\]/,
     },
     {
       name: 'a weight of another shape',

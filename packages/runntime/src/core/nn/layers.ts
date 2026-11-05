@@ -36,7 +36,7 @@ import {
 import { foldBnIntoConv } from '../weights/foldBn.ts';
 import { packQuantW } from '../weights/quantPack.ts';
 import { derivedTensor, type LazyStateDict, type QuantTensor } from '../weights/safetensors.ts';
-import { readFloats, transposeWeight } from '../weights/transforms.ts';
+import { dequantize, readFloats, transposeWeight } from '../weights/transforms.ts';
 import { tensor } from '../gpu/buffers.ts';
 import { CpuParameter, Module, Parameter, type AnyModule } from './module.ts';
 
@@ -256,24 +256,25 @@ export class Linear extends Module {
 }
 
 /** Throws CHECKPOINT_MISMATCH unless the quantized conv weight `t` is its
- *  torch weight with the dims after the first flattened, [rows, cols], and
- *  the conv runs on the quantized matmul over `taps` taps to n columns. */
-function checkQuantConv(
+ *  torch weight with the dims after the first flattened, [rows, cols]. */
+function checkQuantConvShape(
   layer: string,
   name: string,
   t: QuantTensor,
-  shape: { rows: number; cols: number; layout: string; cIn: number; taps: number; n: number },
+  { rows, cols, layout }: { rows: number; cols: number; layout: string },
 ): void {
-  const { rows, cols, layout, cIn, taps, n } = shape;
-  const bad = (why: string): never => {
-    throw new RunntimeError('CHECKPOINT_MISMATCH', `${layer}: ${name} ${why}`);
-  };
   if (t.shape[0] !== rows || t.shape[1] !== cols) {
-    bad(`is quantized as [${t.shape.join(', ')}], expected ${layout} = [${rows}, ${cols}]`);
+    throw new RunntimeError(
+      'CHECKPOINT_MISMATCH',
+      `${layer}: ${name} is quantized as [${t.shape.join(', ')}], expected ${layout} = [${rows}, ${cols}]`,
+    );
   }
-  if (cIn % 4 !== 0 || !matmulQuantTiledEligible(taps * cIn, n)) {
-    bad(`needs in a multiple of 4 and ${taps}·in of ${MATMUL_QUANT_TILED_BK}, got in ${cIn}`);
-  }
+}
+
+/** Whether a conv over `taps` taps of cIn channels to n columns runs on the
+ *  quantized matmul. */
+function quantConvFits(cIn: number, taps: number, n: number): boolean {
+  return cIn % 4 === 0 && matmulQuantTiledEligible(taps * cIn, n);
 }
 
 /** Strided, dilated 1D convolution over time-major [T, inChannels]. No batch
@@ -289,7 +290,8 @@ function checkQuantConv(
  *  group of values along each row. It loads as quantW words with its f32
  *  scales in `weightScale` [in·kernel / groupSize, out]. Output channels pad
  *  up to the packing width, scales and bias with them, and are cut after the
- *  conv. */
+ *  conv. A conv the quantized matmul cannot run loads a quantized weight as
+ *  its dequantized floats. */
 export class Conv1d extends Module {
   readonly weight: Parameter;
   readonly bias?: Parameter;
@@ -333,11 +335,22 @@ export class Conv1d extends Module {
   }
   override transformStateDict(sd: LazyStateDict, prefix: string): void {
     const name = prefix ? `${prefix}.weight` : 'weight';
-    const tensor = sd.tensors.get(name);
+    let tensor = sd.tensors.get(name);
     if (!tensor) return; // a missing key is reported by the strict key check
     if (tensor.kind === 'quant') {
-      this.loadQuantized(sd, prefix, name, tensor);
-      return;
+      const { inChannels: cIn, outChannels: cOut, kernelSize: kernel } = this;
+      checkQuantConvShape('Conv1d', name, tensor, {
+        rows: cOut,
+        cols: cIn * kernel,
+        layout: '[out, in·kernel]',
+      });
+      const width = 32 / tensor.bits;
+      const n = Math.ceil(cOut / width) * width;
+      if (quantConvFits(cIn, kernel, n)) {
+        this.loadQuantized(sd, prefix, name, tensor, n);
+        return;
+      }
+      tensor = dequantize(tensor, [cOut, cIn, kernel]);
     }
     // Without this a weight with equal in/out channels loads scrambled.
     if (
@@ -370,19 +383,15 @@ export class Conv1d extends Module {
   /** Loads `name` as quantW words [kernel·in, n] with its scales
    *  [in·kernel / groupSize, n], where n is outChannels padded to the packing
    *  width. The bias pads to n too. */
-  private loadQuantized(sd: LazyStateDict, prefix: string, name: string, t: QuantTensor): void {
+  private loadQuantized(
+    sd: LazyStateDict,
+    prefix: string,
+    name: string,
+    t: QuantTensor,
+    n: number,
+  ): void {
     const { inChannels: cIn, outChannels: cOut, kernelSize: kernel } = this;
-    const width = 32 / t.bits;
-    const n = Math.ceil(cOut / width) * width;
     const k = kernel * cIn;
-    checkQuantConv('Conv1d', name, t, {
-      rows: cOut,
-      cols: k,
-      layout: '[out, in·kernel]',
-      cIn,
-      taps: kernel,
-      n,
-    });
     const groups = k / t.groupSize;
     this.quantization = { bits: t.bits, groupSize: t.groupSize };
     this.weightScale = loadQuantWeight(
@@ -576,14 +585,18 @@ export class ConvTranspose1d extends Module {
     }
     const k = taps * cIn;
     const cols = cOut * kernel;
-    checkQuantConv('ConvTranspose1d', name, t, {
+    checkQuantConvShape('ConvTranspose1d', name, t, {
       rows: cIn,
       cols,
       layout: '[in, out·kernel]',
-      cIn,
-      taps,
-      n,
     });
+    if (!quantConvFits(cIn, taps, n)) {
+      throw new RunntimeError(
+        'CHECKPOINT_MISMATCH',
+        `ConvTranspose1d: ${name} needs in a multiple of 4 and ${taps}·in of ` +
+          `${MATMUL_QUANT_TILED_BK}, got in ${cIn}`,
+      );
+    }
     this.quantization = { bits: t.bits, groupSize: t.groupSize };
     const groups = cols / t.groupSize;
     this.weightScale = loadQuantWeight(
