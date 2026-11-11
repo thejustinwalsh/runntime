@@ -12,22 +12,39 @@ import {
 } from '../src/core/gpu/eval.ts';
 import type { Value, ValueMeta } from '../src/core/graph/value.ts';
 
-/** Every GPU buffer created on this page and not destroyed yet. Counting
- *  starts when this module loads, so a leak check compares two snapshots,
- *  never an absolute count. */
+/** GPU buffers whose device has not been destroyed or whose buffer has not
+ *  been destroyed yet. Counting starts at module load, so checks compare
+ *  snapshots rather than an absolute count. */
 const live = new Set<GPUBuffer>();
+const buffersPerDevice = new WeakMap<GPUDevice, Set<GPUBuffer>>();
+const devicePerBuffer = new WeakMap<GPUBuffer, GPUDevice>();
 // Node tests import this file for randomF32 and have no WebGPU to wrap.
 if (typeof GPUDevice !== 'undefined') {
   const createBuffer = GPUDevice.prototype.createBuffer;
+  const destroyDevice = GPUDevice.prototype.destroy;
   const destroyBuffer = GPUBuffer.prototype.destroy;
   GPUDevice.prototype.createBuffer = function (desc) {
     const buf = createBuffer.call(this, desc);
     live.add(buf);
+    let buffers = buffersPerDevice.get(this);
+    if (buffers === undefined) {
+      buffers = new Set();
+      buffersPerDevice.set(this, buffers);
+    }
+    buffers.add(buf);
+    devicePerBuffer.set(buf, this);
     return buf;
   };
   GPUBuffer.prototype.destroy = function () {
     live.delete(this);
+    const device = devicePerBuffer.get(this);
+    if (device !== undefined) buffersPerDevice.get(device)?.delete(this);
     destroyBuffer.call(this);
+  };
+  GPUDevice.prototype.destroy = function () {
+    for (const buffer of buffersPerDevice.get(this) ?? []) live.delete(buffer);
+    buffersPerDevice.delete(this);
+    destroyDevice.call(this);
   };
 }
 

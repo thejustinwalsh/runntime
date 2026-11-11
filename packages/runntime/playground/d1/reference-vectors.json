@@ -1,0 +1,228 @@
+{
+  "schemaVersion": 1,
+  "model": "LiquidAI/d1-omni-600M",
+  "revision": "02b55d7076f15129e59ab3f94783f32c4b088674",
+  "reference": {
+    "library": "transformers",
+    "version": "5.22.2",
+    "torch": "2.15.0",
+    "device": "cpu",
+    "dtype": "float32",
+    "platform": "macOS-27.2-arm64-arm-64bit"
+  },
+  "tokenizer": {
+    "revision": "02b55d7076f15129e59ab3f94783f32c4b088674",
+    "bosId": 1,
+    "specialTokenIds": {
+      "<|startoftext|>": 1,
+      "<|reserved_7|>": 17,
+      "<|reserved_8|>": 18,
+      "<|reserved_9|>": 19,
+      "<|reserved_10|>": 20,
+      "<|reserved_11|>": 21,
+      "<|mask|>": 16
+    },
+    "inputs": [
+      {
+        "text": "I was charged twice this month. Please refund one of them.",
+        "ids": [550, 953, 15418, 11126, 1033, 5805, 523, 13831, 53467, 1235, 803, 1377, 523]
+      },
+      {
+        "text": "Is the customer asking for a refund?",
+        "ids": [4940, 779, 13608, 14065, 875, 768, 53467, 540]
+      },
+      {
+        "text": " false: no, the statement does not hold",
+        "ids": [4831, 535, 1295, 521, 779, 8294, 2177, 1014, 3965]
+      },
+      {
+        "text": " true: yes, the statement holds",
+        "ids": [3347, 535, 18672, 521, 779, 8294, 10995]
+      },
+      {
+        "text": "I am comparing phone prices and do not need any refunds or billing help.",
+        "ids": [
+          550, 1283, 19761, 9161, 11128, 810, 1112, 1014, 1595, 1523, 53467, 592, 933, 5363, 800,
+          1801, 523
+        ]
+      },
+      {
+        "text": "The production sign-in page returns HTTP 500 for every user.",
+        "ids": [1098, 3893, 1723, 4086, 4738, 12116, 29700, 730, 4291, 875, 1973, 5196, 523]
+      },
+      {
+        "text": "Which team should handle this?",
+        "ids": [28828, 3410, 1753, 9936, 1033, 540]
+      },
+      {
+        "text": " billing: Charges, refunds, invoices",
+        "ids": [5363, 800, 535, 61958, 774, 521, 53467, 592, 521, 60827, 1864]
+      },
+      {
+        "text": " technical: App or site faults",
+        "ids": [10017, 535, 5135, 933, 3475, 50022]
+      },
+      {
+        "text": " fraud: Suspected unauthorised use",
+        "ids": [24744, 535, 11631, 7937, 59006, 2851, 1517]
+      },
+      {
+        "text": "An outage has taken down the production sign-in service for every user. This blocks all active work, and there is no workaround.",
+        "ids": [
+          2797, 1230, 1047, 1178, 4281, 2208, 779, 3893, 1723, 4086, 3714, 875, 1973, 5196, 523,
+          1470, 12785, 1113, 5592, 1336, 521, 810, 1413, 856, 1295, 64240, 523
+        ]
+      },
+      {
+        "text": "How urgent is this incident?",
+        "ids": [4023, 31149, 856, 1033, 13509, 540]
+      },
+      {
+        "text": " level 0: Routine maintenance with no user impact",
+        "ids": [2119, 730, 525, 535, 27734, 976, 12003, 916, 1295, 5196, 3616]
+      },
+      {
+        "text": " level 1: Low impact and work can continue normally",
+        "ids": [2119, 730, 526, 535, 14322, 3616, 810, 1336, 1011, 5452, 12465]
+      },
+      {
+        "text": " level 2: Some users are slowed but have a workaround",
+        "ids": [2119, 730, 527, 535, 4260, 7039, 938, 49789, 1203, 1052, 768, 64240]
+      },
+      {
+        "text": " level 3: Many users are blocked but a workaround exists",
+        "ids": [2119, 730, 528, 535, 6405, 7039, 938, 26781, 1203, 768, 64240, 9647]
+      },
+      {
+        "text": " level 4: All users are blocked and there is no workaround",
+        "ids": [2119, 730, 529, 535, 2595, 7039, 938, 26781, 810, 1413, 856, 1295, 64240]
+      },
+      {
+        "text": "Task review: acceptance requires explicit overflow errors, serialized execution, cleanup after rejected WebGPU readback, and a fresh decision after device loss. The submission silently truncates input, shares the default executor, does not serialize calls, and leaves uploads alive after readback failure.",
+        "ids": [
+          14736, 4202, 535, 23781, 6835, 13508, 42072, 11752, 521, 16464, 1884, 18156, 521, 50265,
+          1720, 20691, 5220, 24958, 562, 2062, 3321, 521, 810, 768, 7448, 6177, 1720, 6625, 4133,
+          523, 941, 38120, 4598, 2652, 41327, 1338, 6136, 521, 19190, 779, 7335, 64256, 521, 2177,
+          1014, 64318, 10296, 521, 810, 6977, 832, 53934, 16344, 1720, 2062, 3321, 8315, 523
+        ]
+      },
+      {
+        "text": "Does this submission meet every stated acceptance criterion?",
+        "ids": [29589, 1033, 38120, 4159, 1973, 9519, 23781, 37352, 540]
+      }
+    ]
+  },
+  "probabilityTolerance": 0.001,
+  "cases": [
+    {
+      "id": "refund-positive",
+      "state": "I was charged twice this month. Please refund one of them.",
+      "question": {
+        "type": "noul",
+        "instructions": "Is the customer asking for a refund?"
+      },
+      "reference": {
+        "probabilities": [0.9978748559951782, 0.0021251440048217773],
+        "answer": "yes",
+        "inputTokens": 47,
+        "temperatureKey": "noul:2",
+        "temperature": 1.6663223505020142
+      }
+    },
+    {
+      "id": "refund-negative",
+      "state": "I am comparing phone prices and do not need any refunds or billing help.",
+      "question": {
+        "type": "noul",
+        "instructions": "Is the customer asking for a refund?"
+      },
+      "reference": {
+        "probabilities": [0.005074768792837858, 0.9949252312071621],
+        "answer": "no",
+        "inputTokens": 51,
+        "temperatureKey": "noul:2",
+        "temperature": 1.6663223505020142
+      }
+    },
+    {
+      "id": "choice-forward",
+      "state": "The production sign-in page returns HTTP 500 for every user.",
+      "question": {
+        "type": "choice",
+        "instructions": "Which team should handle this?",
+        "criteria": {
+          "billing": "Charges, refunds, invoices",
+          "technical": "App or site faults",
+          "fraud": "Suspected unauthorised use"
+        }
+      },
+      "reference": {
+        "probabilities": [0.006900118198245764, 0.9878022074699402, 0.005297638010233641],
+        "answer": "technical",
+        "inputTokens": 56,
+        "temperatureKey": "choice:3-5",
+        "temperature": 1.3998981714248657
+      }
+    },
+    {
+      "id": "choice-reversed",
+      "state": "The production sign-in page returns HTTP 500 for every user.",
+      "question": {
+        "type": "choice",
+        "instructions": "Which team should handle this?",
+        "criteria": {
+          "fraud": "Suspected unauthorised use",
+          "technical": "App or site faults",
+          "billing": "Charges, refunds, invoices"
+        }
+      },
+      "reference": {
+        "probabilities": [0.0072953407652676105, 0.985370397567749, 0.00733425235375762],
+        "answer": "technical",
+        "inputTokens": 56,
+        "temperatureKey": "choice:3-5",
+        "temperature": 1.3998981714248657
+      }
+    },
+    {
+      "id": "incident-rubric",
+      "state": "An outage has taken down the production sign-in service for every user. This blocks all active work, and there is no workaround.",
+      "question": {
+        "type": "score",
+        "instructions": "How urgent is this incident?",
+        "criteria": [
+          "Routine maintenance with no user impact",
+          "Low impact and work can continue normally",
+          "Some users are slowed but have a workaround",
+          "Many users are blocked but a workaround exists",
+          "All users are blocked and there is no workaround"
+        ]
+      },
+      "reference": {
+        "probabilities": [
+          0.17572106420993805, 0.06221180781722069, 0.09098970890045166, 0.1728348582983017,
+          0.4982426166534424
+        ],
+        "answer": "4",
+        "inputTokens": 111,
+        "temperatureKey": "score:3-5",
+        "temperature": 1.7301132678985596
+      }
+    },
+    {
+      "id": "task-review",
+      "state": "Task review: acceptance requires explicit overflow errors, serialized execution, cleanup after rejected WebGPU readback, and a fresh decision after device loss. The submission silently truncates input, shares the default executor, does not serialize calls, and leaves uploads alive after readback failure.",
+      "question": {
+        "type": "noul",
+        "instructions": "Does this submission meet every stated acceptance criterion?"
+      },
+      "reference": {
+        "probabilities": [0.09012345224618912, 0.9098765477538109],
+        "answer": "no",
+        "inputTokens": 93,
+        "temperatureKey": "noul:2",
+        "temperature": 1.6663223505020142
+      }
+    }
+  ]
+}

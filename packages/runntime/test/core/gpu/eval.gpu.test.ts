@@ -72,9 +72,6 @@ interface GraphCase {
   leftAfterCapture?: string[];
 }
 
-/** The 3-row gatherRows index list. */
-const INDEX_LIST = '12 B, usage 140';
-
 /** Attention with every key visible, q [T, COLS] against k and v
  *  [COLS, COLS]: one head over all COLS columns. */
 const FULL_ATTENTION = {
@@ -107,10 +104,6 @@ const GRAPHS: GraphCase[] = [
   {
     name: 'gatherRows',
     build: ({ x }) => gatherRows(add(x, 1), [3, 0, 3]),
-    // gatherRows uploads its index list on every dispatch and never destroys it.
-    leftPerRun: [INDEX_LIST],
-    leftOnDispose: [INDEX_LIST],
-    leftAfterCapture: [INDEX_LIST],
   },
   {
     name: 'flash attention',
