@@ -15,6 +15,8 @@ export interface DispatchCtx {
   dummy(dtype: 'f16'): F16Buffer;
   dummy(dtype: FloatDtype): F32Buffer | F16Buffer;
   scratch(key: string, elems: number): F32Buffer;
+  /** Releases a dispatch-only upload after its submitted work is complete. */
+  releaseAfterSubmit(buffer: F32Buffer | F16Buffer | U32Buffer): void;
 }
 
 export interface EncodeArgs<Attrs, Cfg extends SpecCfg, Pipe> {

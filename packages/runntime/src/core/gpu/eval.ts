@@ -154,6 +154,9 @@ export function gpuExecutor(root: TgpuRoot, opts: { perf?: GpuPerfSink } = {}): 
   /** Dummies and scratches, destroyed with the executor. A replaced scratch
    *  stays here: memoized handles may still bind it. */
   const owned: { destroy(): void }[] = [];
+  /** Uploads used only by one submitted dispatch, unless a capture retains them. */
+  const pendingUploads = new Set<{ destroy(): void }>();
+  const submittedUploads = new Set<{ destroy(): void }>();
 
   // Filler for bind slots a pipeline never reads. One per dtype, 4 elements,
   // since vec4 layouts need 16 bytes minimum.
@@ -200,6 +203,10 @@ export function gpuExecutor(root: TgpuRoot, opts: { perf?: GpuPerfSink } = {}): 
         owned.push(s.buf);
       }
       return s.buf;
+    },
+    releaseAfterSubmit: (buffer) => {
+      if (capturing) owned.push(buffer);
+      else pendingUploads.add(buffer);
     },
   };
   /** Everything a dispatch's uniforms and bind group derive from. A decode
@@ -275,6 +282,11 @@ export function gpuExecutor(root: TgpuRoot, opts: { perf?: GpuPerfSink } = {}): 
       frozen = false;
       disposals++;
       pool.dispose();
+      handles.length = 0;
+      for (const b of pendingUploads) b.destroy();
+      pendingUploads.clear();
+      for (const b of submittedUploads) b.destroy();
+      submittedUploads.clear();
       for (const b of owned.splice(0)) b.destroy();
       handleCache.clear();
       scratches.clear();
@@ -283,7 +295,11 @@ export function gpuExecutor(root: TgpuRoot, opts: { perf?: GpuPerfSink } = {}): 
     },
     trim: () => {
       // Memoized handles bind the destroyed buffers.
-      if (!frozen && pool.trim()) handleCache.clear();
+      if (!frozen) {
+        for (const b of pendingUploads) b.destroy();
+        pendingUploads.clear();
+        if (pool.trim()) handleCache.clear();
+      }
     },
     /** Queues one node's kernel handles. Nothing runs until submit(). */
     dispatch: (node, inputs, out, extras) => {
@@ -304,16 +320,41 @@ export function gpuExecutor(root: TgpuRoot, opts: { perf?: GpuPerfSink } = {}): 
     },
     /** Encodes every queued handle into one pass and submits once. */
     submit: () => {
-      if (handles.length === 0) return;
+      if (handles.length === 0) {
+        for (const b of pendingUploads) b.destroy();
+        pendingUploads.clear();
+        return;
+      }
       const n = handles.length;
       let readTiming: (() => Promise<GpuSubmitTiming>) | undefined;
-      readbacks.submit((encoder) => {
-        if (perf !== undefined && canTime) {
-          readTiming = encodeTimed(root.device, encoder, handles, perf.perOp === true);
-        } else {
-          encodePass(encoder, handles);
+      try {
+        readbacks.submit((encoder) => {
+          if (perf !== undefined && canTime) {
+            readTiming = encodeTimed(root.device, encoder, handles, perf.perOp === true);
+          } else {
+            encodePass(encoder, handles);
+          }
+        });
+      } catch (err) {
+        for (const b of pendingUploads) b.destroy();
+        pendingUploads.clear();
+        throw err;
+      }
+      const release = [...pendingUploads];
+      pendingUploads.clear();
+      for (const b of release) submittedUploads.add(b);
+      if (release.length > 0) {
+        const free = () => {
+          for (const b of release) {
+            if (submittedUploads.delete(b)) b.destroy();
+          }
+        };
+        try {
+          void root.device.queue.onSubmittedWorkDone().then(free, free);
+        } catch {
+          free();
         }
-      });
+      }
       if (capturing) capturing.push(...handles);
       handles.length = 0;
       perf?.onSubmit(n, readTiming?.());

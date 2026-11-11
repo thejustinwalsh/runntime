@@ -247,15 +247,20 @@ export const gatherRowsSpec = defineSpec({
   encode: ({ node, attrs, pipeline, inputs, out, ctx }) => {
     const dtype = node.shape.dtype;
     const idx = uploadU32(ctx.root, Uint32Array.from(attrs.ids));
-    return [
-      gatherRowsHandle(
+    try {
+      const handle = gatherRowsHandle(
         ctx.root,
         pipeline,
         { total: node.shape.elems, cols: node.shape.dims![1]! },
         idx,
         { x: narrowFloat(inputs[0]!, dtype), out: narrowFloat(out, dtype) },
         elemFor(dtype),
-      ),
-    ];
+      );
+      ctx.releaseAfterSubmit(idx);
+      return [handle];
+    } catch (err) {
+      idx.destroy();
+      throw err;
+    }
   },
 });
