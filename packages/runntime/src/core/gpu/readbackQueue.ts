@@ -56,16 +56,22 @@ export class ReadbackQueue {
     if (this.pending === undefined) return undefined;
     const rb = this.pending;
     this.pending = undefined;
-    let lease: ReturnType<typeof leaseStaging>;
-    const spans: ReturnType<typeof shapeSpan>[] = [];
-    let total = 0;
+    let spans: ReturnType<typeof shapeSpan>[];
     try {
-      for (const v of rb.values) {
-        const span = shapeSpan(v.shape);
-        spans.push(span);
-        total += span.bytes;
-      }
+      spans = rb.values.map((value) => shapeSpan(value.shape));
+    } catch (err) {
+      rb.reject(err);
+      throw err;
+    }
+    const total = spans.reduce((sum, span) => sum + span.bytes, 0);
+    let lease: ReturnType<typeof leaseStaging>;
+    try {
       lease = leaseStaging(this.root, total);
+    } catch (err) {
+      rb.reject(err);
+      throw err;
+    }
+    try {
       let offset = 0;
       rb.values.forEach((v, i) => {
         encoder.copyBufferToBuffer(
@@ -78,13 +84,14 @@ export class ReadbackQueue {
         offset += spans[i]!.bytes;
       });
     } catch (err) {
+      lease.cancel();
       rb.reject(err);
-      return undefined;
+      throw err;
     }
     return (err?: unknown) => {
       if (err !== undefined) {
         rb.reject(err);
-        void lease.finish(() => undefined).catch(() => undefined);
+        lease.cancel();
         return;
       }
       lease

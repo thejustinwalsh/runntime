@@ -1,6 +1,7 @@
 /** Stock nn layers: each holds Parameters and calls the matching op. */
 
 import { RunntimeError } from '../error.ts';
+import type { TgpuRoot } from 'typegpu';
 import { groupNorm, linear } from '../graph/compose.ts';
 import {
   type ConvAct,
@@ -28,6 +29,7 @@ import {
 import { foldBnIntoConv } from '../weights/foldBn.ts';
 import { derivedTensor, type LazyStateDict } from '../weights/safetensors.ts';
 import { tensor } from '../gpu/buffers.ts';
+import { defaultRoot } from '../gpu/context.ts';
 import { CpuParameter, Module, Parameter, type AnyModule } from './module.ts';
 
 /** Token-id lookup table: ids to rows of a [numEmbeddings, dims] weight.
@@ -35,7 +37,7 @@ import { CpuParameter, Module, Parameter, type AnyModule } from './module.ts';
  *  On 'gpu' the weight doubles as a tied LM head, read through `weight.value`
  *  in its raw orientation. On 'cpu' it never reaches the GPU — forward()
  *  gathers the requested rows and uploads those — and tying is unavailable. */
-export class Embedding extends Module<[readonly number[] | Value], Value> {
+export class Embedding extends Module<[readonly number[] | Value, TgpuRoot?], Value> {
   readonly weight: Parameter;
   constructor(
     readonly numEmbeddings: number,
@@ -77,10 +79,10 @@ export class Embedding extends Module<[readonly number[] | Value], Value> {
   /** Token ids to embedded rows [t, dims], always f32. A GPU-resident id
    *  vector lets a captured graph re-run on new tokens; cpu tables take the
    *  array form only. */
-  forward(ids: readonly number[] | Value): Value {
+  forward(ids: readonly number[] | Value, root?: TgpuRoot): Value {
     if (Array.isArray(ids)) {
       return this.weight instanceof CpuParameter
-        ? tensor(this.gather(ids), {
+        ? tensor(root ?? defaultRoot(), this.gather(ids), {
             elems: ids.length * this.embeddingDim,
             dtype: this.weight.shape.dtype,
             dims: [ids.length, this.embeddingDim],

@@ -157,6 +157,12 @@ export function gpuExecutor(root: TgpuRoot, opts: { perf?: GpuPerfSink } = {}): 
   /** Uploads used only by one submitted dispatch, unless a capture retains them. */
   const pendingUploads = new Set<{ destroy(): void }>();
   const submittedUploads = new Set<{ destroy(): void }>();
+  const discard = () => {
+    handles.length = 0;
+    handleCache.clear();
+    for (const b of pendingUploads) b.destroy();
+    pendingUploads.clear();
+  };
 
   // Filler for bind slots a pipeline never reads. One per dtype, 4 elements,
   // since vec4 layouts need 16 bytes minimum.
@@ -275,6 +281,7 @@ export function gpuExecutor(root: TgpuRoot, opts: { perf?: GpuPerfSink } = {}): 
       return pool.acquire(shape);
     },
     releaseOutput: (buffer, shape) => pool.release(buffer, shape),
+    discard,
     // Forgets every handle, dummy and scratch it destroys, so a later
     // dispatch makes fresh ones instead of binding a destroyed buffer. A
     // captured executor can eval and capture again; its old replays throw.
@@ -336,8 +343,7 @@ export function gpuExecutor(root: TgpuRoot, opts: { perf?: GpuPerfSink } = {}): 
           }
         });
       } catch (err) {
-        for (const b of pendingUploads) b.destroy();
-        pendingUploads.clear();
+        discard();
         throw err;
       }
       const release = [...pendingUploads];

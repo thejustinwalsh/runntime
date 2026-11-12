@@ -7,10 +7,12 @@ import {
   type LazyStateDict,
   type LazyTensor,
 } from '../../../src/core/weights/safetensors.ts';
-import { initRunntime } from '../../../src/core/gpu/eval.ts';
-import { createD1Decider } from '../../../src/zoo/d1/decider.ts';
+import { tensor } from '../../../src/core/gpu/buffers.ts';
+import { initRunntime, toArray } from '../../../src/core/gpu/eval.ts';
+import { add } from '../../../src/core/graph/ops.ts';
+import { createD1Decider, type D1Decider } from '../../../src/zoo/d1/decider.ts';
 import type { Answer, D1Tokenizer, Question } from '../../../src/zoo/d1/prompt.ts';
-import { buffersSince, liveBuffers, gpu } from '../../gpu.ts';
+import { buffersSince, expectClose, liveBuffers, gpu } from '../../gpu.ts';
 import vectors from '../../../playground/d1/reference-vectors.json';
 
 declare global {
@@ -541,6 +543,400 @@ it.skipIf(MODE !== 'repaired')(
     });
     expect(decisions).toHaveLength(corpus.cases.length);
     expect(recoveryAfterDispose.length).toBeLessThanOrEqual(1);
+  },
+  900_000,
+);
+
+it.skipIf(MODE !== 'correction')(
+  'qualifies D1 exceptional cleanup, captured-root uploads, and healthy disposal',
+  async (ctx) => {
+    const corpus = requireReferenceCorpus(vectors);
+    const started = performance.now();
+    const { root, ex: sharedExecutor } = await gpu();
+    const original = await fromSafetensors(MODEL_URL);
+    const rawTensors = new Map(original.tensors);
+    const stateDict = () => cloneStateDict(original, new Map(rawTensors));
+    const tokenizer = makeTokenizer(corpus);
+    const temps = temperatures(corpus);
+    const sharedInput = tensor(root, Float32Array.of(2, 4, 6, 8, 10, 12, 14, 16), [1, 8]);
+    const sharedOutput = add(sharedInput, 3);
+    expectClose(await toArray(sharedOutput, sharedExecutor), [5, 7, 9, 11, 13, 15, 17, 19]);
+    sharedExecutor.releaseValues([sharedOutput]);
+
+    const beforeAbortedLoad = liveBuffers();
+    const loadAbort = new AbortController();
+    await expect(
+      createD1Decider(stateDict(), tokenizer, {
+        signal: loadAbort.signal,
+        onProgress: () => loadAbort.abort('correction load abort after first upload'),
+      }),
+    ).rejects.toMatchObject({ code: 'LOAD_ABORTED' });
+    expect(buffersSince(beforeAbortedLoad)).toEqual([]);
+
+    const replacementRoot = await tgpu.init({
+      device: { optionalFeatures: ['subgroups', 'shader-f16'] },
+    });
+    const beforeHealthyCreate = liveBuffers();
+    const baselineStaging = [...beforeHealthyCreate].filter(
+      (buffer) => (buffer.usage & GPUBufferUsage.MAP_READ) !== 0,
+    );
+    const baselineUniforms = [...beforeHealthyCreate].filter(
+      (buffer) => (buffer.usage & GPUBufferUsage.UNIFORM) !== 0,
+    );
+    const baselineGpuBufferBytes = [...beforeHealthyCreate].reduce(
+      (sum, buffer) => sum + buffer.size,
+      0,
+    );
+    let replacementExecutor: ReturnType<typeof initRunntime> | undefined;
+    let changedRootDuringLoad = false;
+    let loadedWeightBytes = 0;
+    let progressDoneBytes = 0;
+    let progressTotalBytes = 0;
+    let peakGpuBufferBytes = gpuBufferBytes();
+    let peakJsHeapBytes: number | null = null;
+    let peakAgentBytes: number | null = null;
+    const loadStarted = performance.now();
+    let decider: D1Decider | undefined;
+    let freshDecider: D1Decider | undefined;
+    let freshInput: ReturnType<typeof tensor> | undefined;
+    const decisions: Record<string, unknown>[] = [];
+    const verifyDecision = (
+      result: Awaited<ReturnType<D1Decider['systemOne']>>,
+      item: ReferenceCase,
+      id = item.id,
+    ) => {
+      const answer = result.answers.answer!;
+      const got = probabilities(answer, item.question);
+      const maxAbsError = Math.max(
+        ...got.map((probability, index) =>
+          Math.abs(probability - item.reference.probabilities[index]!),
+        ),
+      );
+      expect(result.inputTokens).toBe(item.reference.inputTokens);
+      expect(stableAnswer(answer, item.question)).toBe(item.reference.answer);
+      expect(maxAbsError).toBeLessThanOrEqual(TOLERANCE);
+      decisions.push({
+        id,
+        inputTokens: result.inputTokens,
+        answer: stableAnswer(answer, item.question),
+        probabilities: got,
+        maxAbsError,
+      });
+      peakGpuBufferBytes = Math.max(peakGpuBufferBytes, gpuBufferBytes());
+    };
+    const decide = async (item: ReferenceCase, id = item.id) => {
+      const decisionStarted = performance.now();
+      const result = await decider!.systemOne(item.state, { answer: item.question });
+      verifyDecision(result, item, id);
+      decisions.at(-1)!.latencyMs = +(performance.now() - decisionStarted).toFixed(2);
+      const memory = await hostMemory();
+      if (memory.jsHeapBytes !== null)
+        peakJsHeapBytes = Math.max(peakJsHeapBytes ?? 0, memory.jsHeapBytes);
+      if (memory.agentBytes !== null)
+        peakAgentBytes = Math.max(peakAgentBytes ?? 0, memory.agentBytes);
+    };
+
+    try {
+      decider = await createD1Decider(stateDict(), tokenizer, {
+        temperatures: temps,
+        onProgress: (_name, done, total) => {
+          loadedWeightBytes = total;
+          progressDoneBytes = done;
+          progressTotalBytes = total;
+          peakGpuBufferBytes = Math.max(peakGpuBufferBytes, gpuBufferBytes());
+          if (!changedRootDuringLoad) {
+            replacementExecutor = initRunntime(replacementRoot);
+            changedRootDuringLoad = true;
+          }
+        },
+      });
+      const loadMs = performance.now() - loadStarted;
+      const loadedMemory = await hostMemory();
+      peakJsHeapBytes = loadedMemory.jsHeapBytes;
+      peakAgentBytes = loadedMemory.agentBytes;
+      peakGpuBufferBytes = Math.max(peakGpuBufferBytes, gpuBufferBytes());
+      expect(changedRootDuringLoad).toBe(true);
+
+      for (const item of corpus.cases) await decide(item);
+      initRunntime(replacementRoot);
+      await decide(corpus.cases[0]!, 'old-decider-after-root-reinitialization');
+
+      const firstCase = corpus.cases[0]!;
+      const expectExecutionFailure = (promise: Promise<unknown>) =>
+        expect(promise).rejects.toMatchObject({ code: 'EXECUTION_FAILED' });
+
+      const originalDispatch = GPUComputePassEncoder.prototype.dispatchWorkgroups;
+      let dispatches = 0;
+      GPUComputePassEncoder.prototype.dispatchWorkgroups = function (x, y, z) {
+        dispatches++;
+        if (dispatches === 4) throw new Error('correction rejected command encoding');
+        return originalDispatch.call(this, x, y, z);
+      };
+      try {
+        await expectExecutionFailure(
+          decider.systemOne(firstCase.state, { answer: firstCase.question }),
+        );
+      } finally {
+        GPUComputePassEncoder.prototype.dispatchWorkgroups = originalDispatch;
+      }
+      expect(dispatches).toBe(4);
+      await decide(firstCase, 'recovered-after-command-encoding-failure');
+
+      const originalSubmit = GPUQueue.prototype.submit;
+      let rejectedSubmission = false;
+      GPUQueue.prototype.submit = function (commands) {
+        if (this === root.device.queue && !rejectedSubmission) {
+          rejectedSubmission = true;
+          throw new Error('correction rejected queue submission');
+        }
+        return originalSubmit.call(this, commands);
+      };
+      try {
+        await expectExecutionFailure(
+          decider.systemOne(firstCase.state, { answer: firstCase.question }),
+        );
+      } finally {
+        GPUQueue.prototype.submit = originalSubmit;
+      }
+      expect(rejectedSubmission).toBe(true);
+      await decide(firstCase, 'recovered-after-queue-submission-failure');
+
+      const originalCreateBindGroup = GPUDevice.prototype.createBindGroup;
+      let bindGroups = 0;
+      GPUDevice.prototype.createBindGroup = function (descriptor) {
+        if (this === root.device && ++bindGroups === 9) {
+          throw new Error('correction rejected partial graph evaluation');
+        }
+        return originalCreateBindGroup.call(this, descriptor);
+      };
+      try {
+        await expectExecutionFailure(
+          decider.systemOne(firstCase.state, { answer: firstCase.question }),
+        );
+      } finally {
+        GPUDevice.prototype.createBindGroup = originalCreateBindGroup;
+      }
+      expect(bindGroups).toBe(9);
+      await decide(firstCase, 'recovered-after-partial-evaluation-failure');
+
+      const beforeReadbackFailure = liveBuffers();
+      const originalMapAsync = GPUBuffer.prototype.mapAsync;
+      let rejectReadback = true;
+      GPUBuffer.prototype.mapAsync = function (mode, offset, size) {
+        if (rejectReadback) {
+          rejectReadback = false;
+          return Promise.reject(new Error('correction rejected readback'));
+        }
+        return originalMapAsync.call(this, mode, offset, size);
+      };
+      try {
+        await expectExecutionFailure(
+          decider.systemOne(firstCase.state, { answer: firstCase.question }),
+        );
+      } finally {
+        GPUBuffer.prototype.mapAsync = originalMapAsync;
+      }
+      await root.device.queue.onSubmittedWorkDone();
+      expect(buffersSince(beforeReadbackFailure)).toEqual([]);
+      await decide(firstCase, 'recovered-after-readback-failure');
+
+      const preAborted = new AbortController();
+      preAborted.abort('correction pre-abort');
+      const beforePreAbort = liveBuffers();
+      await expect(
+        decider.systemOne(firstCase.state, { answer: firstCase.question }, undefined, {
+          signal: preAborted.signal,
+        }),
+      ).rejects.toMatchObject({ code: 'EXECUTION_FAILED' });
+      expect(buffersSince(beforePreAbort)).toEqual([]);
+
+      const queuedAbort = new AbortController();
+      const first = decider.systemOne(firstCase.state, { answer: firstCase.question });
+      const second = decider.systemOne(
+        corpus.cases[1]!.state,
+        { answer: corpus.cases[1]!.question },
+        undefined,
+        { signal: queuedAbort.signal },
+      );
+      queuedAbort.abort('correction queued abort');
+      verifyDecision(await first, firstCase, 'active-before-queued-abort');
+      await expect(second).rejects.toMatchObject({ code: 'EXECUTION_FAILED' });
+
+      const activeAbort = new AbortController();
+      const abortWork = decider.systemOne(
+        firstCase.state,
+        { answer: firstCase.question },
+        undefined,
+        { signal: activeAbort.signal },
+      );
+      await Promise.resolve();
+      activeAbort.abort('correction active abort');
+      await expect(abortWork).rejects.toMatchObject({ code: 'EXECUTION_FAILED' });
+      await decide(firstCase, 'recovered-after-active-abort');
+
+      const disposeCase = corpus.cases[0]!;
+      const active = decider.systemOne(disposeCase.state, { answer: disposeCase.question });
+      await Promise.resolve();
+      const queued = decider.systemOne(corpus.cases[1]!.state, {
+        answer: corpus.cases[1]!.question,
+      });
+      const disposeStarted = performance.now();
+      const disposal = decider.dispose();
+      expect(decider.dispose()).toBe(disposal);
+      verifyDecision(await active, disposeCase, 'active-during-healthy-disposal');
+      await expect(queued).rejects.toMatchObject({ code: 'RESOURCE_DISPOSED' });
+      await expect(
+        decider.systemOne(firstCase.state, { answer: firstCase.question }),
+      ).rejects.toMatchObject({ code: 'RESOURCE_DISPOSED' });
+      await disposal;
+      const healthyDisposeMs = performance.now() - disposeStarted;
+      const afterHealthyDispose = [...liveBuffers()].filter(
+        (buffer) => !beforeHealthyCreate.has(buffer),
+      );
+      const healthyUniforms = afterHealthyDispose.filter(
+        (buffer) => (buffer.usage & GPUBufferUsage.UNIFORM) !== 0,
+      );
+      const healthyStaging = afterHealthyDispose.filter(
+        (buffer) => (buffer.usage & GPUBufferUsage.MAP_READ) !== 0,
+      );
+      const healthyOwned = afterHealthyDispose.filter(
+        (buffer) =>
+          (buffer.usage & GPUBufferUsage.UNIFORM) === 0 &&
+          (buffer.usage & GPUBufferUsage.MAP_READ) === 0,
+      );
+      expect(healthyOwned).toHaveLength(0);
+
+      const sharedAfterDispose = add(sharedInput, 3);
+      expectClose(await toArray(sharedAfterDispose, sharedExecutor), [5, 7, 9, 11, 13, 15, 17, 19]);
+      sharedExecutor.releaseValues([sharedAfterDispose]);
+
+      initRunntime(replacementRoot);
+      const currentReplacementExecutor = replacementExecutor;
+      if (currentReplacementExecutor === undefined) {
+        throw new Error('replacement executor was not initialized during loading');
+      }
+      freshInput = tensor(replacementRoot, Float32Array.of(4, 6, 8, 10, 12, 14, 16, 18), [1, 8]);
+      const freshSharedOutput = add(freshInput, 2);
+      expectClose(
+        await toArray(freshSharedOutput, currentReplacementExecutor),
+        [6, 8, 10, 12, 14, 16, 18, 20],
+      );
+      currentReplacementExecutor.releaseValues([freshSharedOutput]);
+      const beforeFreshCreate = liveBuffers();
+      const freshStaging = [...beforeFreshCreate].filter(
+        (buffer) => (buffer.usage & GPUBufferUsage.MAP_READ) !== 0,
+      );
+      const freshUniforms = [...beforeFreshCreate].filter(
+        (buffer) => (buffer.usage & GPUBufferUsage.UNIFORM) !== 0,
+      );
+      const freshLoadStarted = performance.now();
+      freshDecider = await createD1Decider(stateDict(), tokenizer, { temperatures: temps });
+      const freshLoadMs = performance.now() - freshLoadStarted;
+      const freshCase = corpus.cases[0]!;
+      const freshDecisionStarted = performance.now();
+      const freshResult = await freshDecider.systemOne(freshCase.state, {
+        answer: freshCase.question,
+      });
+      const freshDecisionMs = performance.now() - freshDecisionStarted;
+      verifyDecision(freshResult, freshCase, 'fresh-device-reference');
+      const freshDisposeStarted = performance.now();
+      await freshDecider.dispose();
+      await replacementRoot.device.queue.onSubmittedWorkDone();
+      const freshDisposeMs = performance.now() - freshDisposeStarted;
+      const afterFreshDispose = [...liveBuffers()].filter(
+        (buffer) => !beforeFreshCreate.has(buffer),
+      );
+      const freshUniformsAfterDispose = afterFreshDispose.filter(
+        (buffer) => (buffer.usage & GPUBufferUsage.UNIFORM) !== 0,
+      );
+      const freshStagingAfterDispose = afterFreshDispose.filter(
+        (buffer) => (buffer.usage & GPUBufferUsage.MAP_READ) !== 0,
+      );
+      const freshOwned = afterFreshDispose.filter(
+        (buffer) =>
+          (buffer.usage & GPUBufferUsage.UNIFORM) === 0 &&
+          (buffer.usage & GPUBufferUsage.MAP_READ) === 0,
+      );
+      expect(freshOwned).toHaveLength(0);
+
+      const report = {
+        mode: MODE,
+        correctionBase: '735fbd94195a8c2a7c40a12aec6b86fa34ebd48c',
+        model: MODEL,
+        revision: REVISION,
+        elapsedMs: +(performance.now() - started).toFixed(2),
+        loadMs: +loadMs.toFixed(2),
+        loadedWeightBytes,
+        progressDoneBytes,
+        progressTotalBytes,
+        decisions,
+        peakJsHeapBytes,
+        peakAgentBytes,
+        peakGpuBufferBytes,
+        healthyAllocationBaseline: {
+          gpuBufferCount: beforeHealthyCreate.size,
+          gpuBufferBytes: baselineGpuBufferBytes,
+          sharedStagingBufferCount: baselineStaging.length,
+          sharedStagingBufferBytes: baselineStaging.reduce((sum, buffer) => sum + buffer.size, 0),
+          sharedUniformBufferCount: baselineUniforms.length,
+          sharedUniformBufferBytes: baselineUniforms.reduce((sum, buffer) => sum + buffer.size, 0),
+          newSharedStagingBufferCount: healthyStaging.length,
+          newSharedStagingBufferBytes: healthyStaging.reduce((sum, buffer) => sum + buffer.size, 0),
+          newSharedUniformBufferCount: healthyUniforms.length,
+          newSharedUniformBufferBytes: healthyUniforms.reduce(
+            (sum, buffer) => sum + buffer.size,
+            0,
+          ),
+          unownedBuffersAfterDispose: healthyOwned.length,
+          disposeMs: +healthyDisposeMs.toFixed(2),
+        },
+        freshDevice: {
+          loadMs: +freshLoadMs.toFixed(2),
+          decisionMs: +freshDecisionMs.toFixed(2),
+          inputTokens: freshResult.inputTokens,
+          answer: stableAnswer(freshResult.answers.answer!, freshCase.question),
+          sharedStagingBufferCount: freshStaging.length,
+          sharedStagingBufferBytes: freshStaging.reduce((sum, buffer) => sum + buffer.size, 0),
+          sharedUniformBufferCount: freshUniforms.length,
+          sharedUniformBufferBytes: freshUniforms.reduce((sum, buffer) => sum + buffer.size, 0),
+          newSharedStagingBufferCount: freshStagingAfterDispose.length,
+          newSharedStagingBufferBytes: freshStagingAfterDispose.reduce(
+            (sum, buffer) => sum + buffer.size,
+            0,
+          ),
+          newSharedUniformBufferCount: freshUniformsAfterDispose.length,
+          newSharedUniformBufferBytes: freshUniformsAfterDispose.reduce(
+            (sum, buffer) => sum + buffer.size,
+            0,
+          ),
+          unownedBuffersAfterDispose: freshOwned.length,
+          disposeMs: +freshDisposeMs.toFixed(2),
+        },
+        measurements: {
+          hostPeak:
+            peakJsHeapBytes === null && peakAgentBytes === null
+              ? 'unknown: browser exposes no host peak'
+              : 'sampled browser memory; not a process-wide peak',
+          gpuPeak: 'sum of live GPUBuffer.size snapshots; driver-private allocations are unknown',
+          disposal:
+            'no new D1-owned buffers after healthy disposal; per-root uniform buffers are retained by dispatchCache and MAP_READ staging is shared by readback; both are reported separately; neither device was destroyed',
+        },
+      };
+      console.info('D1_SAFETY_CORRECTION', JSON.stringify(report));
+      await ctx.annotate('D1_SAFETY_CORRECTION', {
+        contentType: 'application/json',
+        body: JSON.stringify(report, null, 2),
+      });
+      expect(decisions).toHaveLength(corpus.cases.length + 9);
+      expect(sharedInput.state).toBe('materialized');
+    } finally {
+      await decider?.dispose();
+      await freshDecider?.dispose();
+      sharedExecutor.dispose();
+      replacementExecutor?.dispose();
+      sharedInput.buffer.destroy();
+      freshInput?.buffer.destroy();
+    }
   },
   900_000,
 );

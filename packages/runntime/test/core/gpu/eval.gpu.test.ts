@@ -316,3 +316,44 @@ describe('gpuExecutor trim', () => {
     expectClose(await got, ref(next, rows));
   });
 });
+
+it('rolls back outputs and queued commands after a partial evaluation failure', async () => {
+  const ex = gpuExecutor(root);
+  const firstInput = upload(root, randomF32(ROWS * COLS, 31), [ROWS, COLS]);
+  let dispatches = 0;
+  const failingExecutor: RunntimeExecutor = {
+    ...ex,
+    dispatch: (...args) => {
+      if (++dispatches === 2) throw new Error('injected partial evaluation failure');
+      ex.dispatch(...args);
+    },
+  };
+  try {
+    const warmOutput = tanh(add(firstInput, 1));
+    evalValues([warmOutput], ex);
+    await ex.readback(warmOutput.buffer, warmOutput.shape);
+    ex.releaseValues([warmOutput]);
+    ex.trim();
+
+    const failed = tanh(add(firstInput, 1));
+    expect(() => evalValues([failed], failingExecutor)).toThrow(
+      'injected partial evaluation failure',
+    );
+    expect(failed.state).toBe('pending');
+    expect(() => evalValues([failed], ex)).toThrow('evaluation failed before submission');
+
+    firstInput.buffer.destroy();
+    const nextInput = upload(root, randomF32(ROWS * COLS, 32), [ROWS, COLS]);
+    const beforeRecovery = liveBuffers();
+    const output = tanh(add(nextInput, 1));
+    evalValues([output], ex);
+    const actual = await ex.readback(output.buffer, output.shape);
+    const expected = Float32Array.from(randomF32(ROWS * COLS, 32), (value) => Math.tanh(value + 1));
+    expectClose(actual, expected);
+    ex.releaseValues([output]);
+    ex.trim();
+    expect(buffersSince(beforeRecovery)).toEqual([]);
+  } finally {
+    ex.dispose();
+  }
+});

@@ -87,7 +87,7 @@ export async function createD1Decider(
       },
     });
     throwIfAborted(opts.signal);
-    zeroRow = tensor(new Float32Array(D1.hidden), [1, D1.hidden]);
+    zeroRow = tensor(root, new Float32Array(D1.hidden), [1, D1.hidden]);
 
     const temperatures = opts.temperatures ?? {};
     const posTable = model.vision.position_embedding.data;
@@ -109,9 +109,9 @@ export async function createD1Decider(
     const encodeImage = (img: RgbImage, uploads: Value[]): Value => {
       const parts = preprocessImage(img).map(({ ph, pw, patches }) => {
         const pos = resizeAA(posTable, D1.posGrid, D1.posGrid, D1.visionHidden, ph, pw);
-        const p = tensor(patches, [ph * pw, 3 * 16 * 16]);
+        const p = tensor(root, patches, [ph * pw, 3 * 16 * 16]);
         uploads.push(p);
-        const q = tensor(pos, [ph * pw, D1.visionHidden]);
+        const q = tensor(root, pos, [ph * pw, D1.visionHidden]);
         uploads.push(q);
         return model.vision.forward(p, q, ph, pw);
       });
@@ -131,10 +131,10 @@ export async function createD1Decider(
         throwIfDecisionAborted(signal);
         const p = prefix ? prefix.shape.dims![0]! : 0;
         const t = p + ids.length;
-        const emb = track(model.encoder.embed_tokens.forward(ids), uploads);
+        const emb = track(model.encoder.embed_tokens.forward(ids, root), uploads);
         const { cos: c, sin: s } = ropeTables(t);
-        const cos = track(tensor(c, [t, D1.headDim]), uploads);
-        const sin = track(tensor(s, [t, D1.headDim]), uploads);
+        const cos = track(tensor(root, c, [t, D1.headDim]), uploads);
+        const sin = track(tensor(root, s, [t, D1.headDim]), uploads);
         let segments: Value | undefined;
         let keepRight: Value | undefined;
         if (p > 0) {
@@ -142,10 +142,10 @@ export async function createD1Decider(
           const keep = new Float32Array(t).fill(1);
           for (let i = 0; i < t; i++) seg[2 * i + 1] = i < p ? p : t;
           keep[p - 1] = 0;
-          segments = track(tensor(seg, [t, 2]), uploads);
-          keepRight = track(tensor(keep, [t, 1]), uploads);
+          segments = track(tensor(root, seg, [t, 2]), uploads);
+          keepRight = track(tensor(root, keep, [t, 1]), uploads);
         }
-        const typeRow = track(model.head.type_emb.forward([QTYPES[q.type]]), uploads);
+        const typeRow = track(model.head.type_emb.forward([QTYPES[q.type]], root), uploads);
         const h = model.encoder.forward(prefix ? cat([prefix, emb], 0) : emb, {
           cos,
           sin,

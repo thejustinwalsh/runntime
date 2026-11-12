@@ -189,6 +189,8 @@ const stagingPerRoot = new WeakMap<TgpuRoot, { buf: GPUBuffer; size: number; bus
  *  the standalone encode-and-submit form. */
 export interface StagingLease {
   staging: GPUBuffer;
+  /** Releases a lease when its command buffer was not submitted. */
+  cancel(): void;
   finish<T>(read: (mapped: ArrayBuffer) => T): Promise<T>;
 }
 
@@ -221,8 +223,16 @@ export function leaseStaging(root: TgpuRoot, byteSize: number): StagingLease {
     staging = entry.buf;
   }
   const shared = entry;
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    if (transient) staging.destroy();
+    else shared.busy = false;
+  };
   return {
     staging,
+    cancel: release,
     async finish<T>(read: (mapped: ArrayBuffer) => T): Promise<T> {
       // On every path: a throw must not leave the slot marked busy, which
       // would push every later readback onto a transient buffer.
@@ -234,8 +244,7 @@ export function leaseStaging(root: TgpuRoot, byteSize: number): StagingLease {
           staging.unmap();
         }
       } finally {
-        if (transient) staging.destroy();
-        else shared.busy = false;
+        release();
       }
     },
   };
