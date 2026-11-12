@@ -148,6 +148,7 @@ export default defineConfig({
                     { label: 'Speech to text', slug: 'zoo/speech-to-text' },
                     { label: 'Privacy filter', slug: 'zoo/privacy-filter' },
                     { label: 'D1 decision model', slug: 'zoo/d1' },
+                    { label: 'LFM3 chat', slug: 'zoo/lfm3-chat' },
                     { label: 'Object detection', slug: 'zoo/object-detection' },
                     { label: 'Instance segmentation', slug: 'zoo/instance-segmentation' },
                     { label: 'Pose & keypoints', slug: 'zoo/pose-and-keypoints' },

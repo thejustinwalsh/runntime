@@ -45,6 +45,15 @@ export {
 } from './tasks/nlp/privacyFilter.ts';
 export { createD1Decider, type D1Decider, type D1DeciderModel } from './tasks/nlp/d1.ts';
 export type { Answer, Question, QuestionType } from './d1/prompt.ts';
+export {
+  createLfm3Chat,
+  type Lfm3ChatModel,
+  type Lfm3ChatOptions,
+  type Lfm3ChatSession,
+  type Lfm3Generation,
+  type Lfm3GenerationResult,
+  type Lfm3Message,
+} from './tasks/nlp/lfm3.ts';
 
 export {
   createSpeechToText,

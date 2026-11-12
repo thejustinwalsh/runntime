@@ -92,6 +92,52 @@ export function conv1d(
   );
 }
 
+/** Depthwise 1-D convolution over time-major [T, C], with channel-major
+ *  weights [C, K]. Padding is zero-filled on either side. */
+export function depthwiseConv1d(
+  x: Value,
+  w: Value,
+  opts: { kernelSize: number; padLeft?: number; padRight?: number },
+): Value {
+  const { kernelSize } = opts;
+  const padLeft = opts.padLeft ?? 0;
+  const padRight = opts.padRight ?? 0;
+  const [tIn, channels, dtype] = want2d('depthwiseConv1d', x, FLOAT_DTYPES);
+  const [weightChannels, weightKernel, weightDtype] = want2d('depthwiseConv1d.w', w, FLOAT_DTYPES);
+  if (weightDtype !== dtype) {
+    throw new Error(`depthwiseConv1d: weight dtype ${weightDtype} must match the input's ${dtype}`);
+  }
+  if (!Number.isInteger(kernelSize) || kernelSize < 1) {
+    throw new Error(`depthwiseConv1d: kernelSize ${kernelSize} must be a positive integer`);
+  }
+  for (const [name, pad] of [
+    ['padLeft', padLeft],
+    ['padRight', padRight],
+  ] as const) {
+    if (!Number.isInteger(pad) || pad < 0 || pad >= kernelSize) {
+      throw new Error(`depthwiseConv1d: ${name} ${pad} must be in [0, ${kernelSize})`);
+    }
+  }
+  if (weightChannels !== channels || weightKernel !== kernelSize) {
+    throw new Error(
+      `depthwiseConv1d: weight shape [${weightChannels}, ${weightKernel}] must be [${channels}, ${kernelSize}]`,
+    );
+  }
+  if (tIn + padLeft + padRight < kernelSize) {
+    throw new Error(
+      `depthwiseConv1d: padded frames ${tIn + padLeft + padRight} < kernelSize ${kernelSize}`,
+    );
+  }
+  const tOut = tIn + padLeft + padRight - kernelSize + 1;
+  return pending(
+    { elems: tOut * channels, dtype, dims: [tOut, channels] },
+    'depthwiseConv1d',
+    [x, w],
+    undefined,
+    [kernelSize, padLeft],
+  );
+}
+
 /** GLU then a causal depthwise conv over time, in one dispatch. x [T, 2C] is
  *  clamped to [lo, hi] and gated, first half by σ of the second; w tap-major
  *  [kernelSize, C] then mixes each channel's last kernelSize frames.

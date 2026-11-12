@@ -81,6 +81,7 @@ export type OpName =
   | 'rope'
   // conv
   | 'conv1d'
+  | 'depthwiseConv1d'
   | 'gluConv1d'
   | 'convTranspose2d'
   | 'conv2dHwc4'

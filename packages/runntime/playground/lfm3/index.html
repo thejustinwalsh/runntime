@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>LFM3 chat on ruNNtime</title>
+    <style>
+      body {
+        margin: 2rem auto;
+        max-width: 48rem;
+        padding: 0 1rem;
+        color: #eee;
+        background: #17171b;
+        font:
+          16px system-ui,
+          sans-serif;
+      }
+      button,
+      textarea {
+        color: inherit;
+        background: #24242b;
+        border: 1px solid #595965;
+        border-radius: 0.35rem;
+        padding: 0.65rem;
+      }
+      button {
+        cursor: pointer;
+      }
+      textarea {
+        box-sizing: border-box;
+        width: 100%;
+        min-height: 6rem;
+      }
+      pre {
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+      }
+      #status {
+        color: #aaa;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>LFM3 chat on WebGPU</h1>
+    <p>This loads the original BF16 checkpoint. Its text weights are several gigabytes.</p>
+    <button id="load">Load model</button>
+    <progress id="progress" max="1" value="0"></progress>
+    <p id="status">Model not loaded</p>
+    <pre id="chat"></pre>
+    <textarea id="prompt" aria-label="Message" placeholder="Write a message"></textarea>
+    <p>
+      <button id="send" disabled>Send</button>
+      <button id="cancel" disabled>Cancel generation</button>
+      <button id="reset" disabled>Reset conversation</button>
+    </p>
+    <script type="module" src="./main.ts"></script>
+  </body>
+</html>

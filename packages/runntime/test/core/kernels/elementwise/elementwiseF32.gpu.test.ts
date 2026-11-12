@@ -123,6 +123,27 @@ describe('elementwiseF32 kernel', () => {
     expectClose(got, swigluRef(glu, lin), { atol: 1e-3, rtol: 1e-3 });
   });
 
+  it('repeats attention gates over contiguous head dimensions', async () => {
+    const rows = 2;
+    const heads = 3;
+    const headDim = 4;
+    const x = Float32Array.from({ length: rows * heads * headDim }, (_, i) => i + 1);
+    const gate = new Float32Array([2, -1, 0.5, -2, 3, 4]);
+    const expected = Float32Array.from(
+      x,
+      (value, i) =>
+        value *
+        gate[
+          Math.floor(i / (heads * headDim)) * heads + Math.floor((i % (heads * headDim)) / headDim)
+        ]!,
+    );
+    const got = await toArray(
+      mul(upload(root, x, [rows, heads * headDim]), upload(root, gate, [rows, heads])),
+      ex,
+    );
+    expectClose(got, expected, { atol: 0, rtol: 0 });
+  });
+
   it('adds past 2^24 elements, which takes the second grid dimension', async () => {
     const n = 2 ** 24 + 3;
     expect(n).toBeGreaterThan(GRID_Y_STRIDE);

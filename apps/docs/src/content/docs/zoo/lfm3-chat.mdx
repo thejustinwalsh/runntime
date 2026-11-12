@@ -1,0 +1,57 @@
+---
+title: LFM3 chat
+description: Stream text from Liquid's original LFM3-Omni-2B base checkpoint on WebGPU.
+---
+
+`createLfm3Chat` loads Liquid's original floating LFM3-Omni-2B text model from
+its pinned Hugging Face revision and returns a serialized streaming session.
+Initialize ruNNtime with TypeGPU before loading the model.
+
+```ts twoslash
+import tgpu from 'typegpu';
+import { createLfm3Chat, initRunntime, models } from 'runntime/zoo';
+
+initRunntime(await tgpu.init({ device: { optionalFeatures: ['subgroups'] } }));
+// ---cut---
+const chat = await createLfm3Chat(models.lfm3.LFM3_OMNI_2B.DEFAULT);
+const messages = [{ role: 'user' as const, content: 'Explain WebGPU in one sentence.' }];
+const generation = chat.generate(messages, { maxNewTokens: 64 });
+
+for await (const text of generation) console.log(text);
+const result = await generation.result;
+console.log(result.finishReason, result.completionTokens);
+
+await chat.dispose();
+```
+
+Each update is newly decoded text. Pass the conversation history on each call;
+the session does not retain message text. `generation.result` resolves to the
+complete response and token counts. Call `generation.cancel()` or pass an
+`AbortSignal` to stop a request. `reset()` cancels queued and active requests;
+`dispose()` waits for them to finish and releases the model's GPU resources.
+
+The shared zoo load options support byte and tensor progress, abort, caching and
+warm-up. Warm-up runs by default. A custom `RangeSource` can replace the model
+URL; when a `WeightCache` is used with a `RangeSource`, pass a stable `cacheId`.
+
+This entry currently handles text messages only. It does not load the audio or
+vision towers and does not accept image, audio or video content.
+
+## Checkpoint and license
+
+The model and tokenizer are pinned to Liquid's original
+[LFM3-Omni-2B checkpoint](https://huggingface.co/LiquidAI/LFM3-Omni-2B/tree/21d75123f86c1f7ffb4bef1ea202710c4e7ebe67),
+revision `21d75123f86c1f7ffb4bef1ea202710c4e7ebe67`. The checkpoint is BF16;
+ruNNtime decodes those weights to F32 and applies lossless layout transforms
+for its native operators. It does not use the quantized GGUF or ONNX model.
+
+The tokenizer asset's SHA-256 is
+`41927bd314d17d7d7fadb44e10cd0919f7b71528d7741596d8cbd15c6945ec44`.
+The model weights are © Liquid AI, Inc. and licensed under the
+[LFM Open License v1.0](https://huggingface.co/LiquidAI/LFM3-Omni-2B/blob/21d75123f86c1f7ffb4bef1ea202710c4e7ebe67/LICENSE).
+Commercial use by a legal entity is licensed only while its annual revenue is
+below the license's $10 million threshold. The threshold exception for qualified
+non-profit organizations applies to non-commercial or research use. Review the
+full license for its terms. The ruNNtime package license covers runtime code, not
+the model. Weights are fetched from Hugging Face and are not redistributed by
+ruNNtime.

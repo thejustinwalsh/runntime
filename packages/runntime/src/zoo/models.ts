@@ -17,6 +17,7 @@ import type { KeypointDetectorModel } from './tasks/cv/keypointDetection.ts';
 import type { EmbedderModel } from './tasks/multimodal/embedding.ts';
 import type { PrivacyFilterModel } from './tasks/nlp/privacyFilter.ts';
 import type { D1DeciderModel } from './tasks/nlp/d1.ts';
+import type { Lfm3ChatModel } from './tasks/nlp/lfm3.ts';
 
 const HUB = 'https://huggingface.co/software-mansion';
 
@@ -126,7 +127,19 @@ const D1_F32 = {
   modelPath: `https://huggingface.co/LiquidAI/d1-omni-600M/resolve/${D1_REVISION}/model.safetensors`,
 } satisfies D1DeciderModel;
 
+const LFM3_REVISION = '21d75123f86c1f7ffb4bef1ea202710c4e7ebe67';
+const LFM3_OMNI_2B = {
+  modelPath: `https://huggingface.co/LiquidAI/LFM3-Omni-2B/resolve/${LFM3_REVISION}/model.safetensors`,
+  tokenizerPath: `https://huggingface.co/LiquidAI/LFM3-Omni-2B/resolve/${LFM3_REVISION}/tokenizer.json`,
+} satisfies Lfm3ChatModel;
+
 export const models = {
+  lfm3: {
+    /** Liquid LFM3-Omni 2B original BF16 text backbone. */
+    LFM3_OMNI_2B: {
+      DEFAULT: LFM3_OMNI_2B,
+    },
+  },
   d1: {
     /** Liquid's D1 Omni 600M text decision model. Q8 weights are generated locally. */
     D1_OMNI_600M: {
