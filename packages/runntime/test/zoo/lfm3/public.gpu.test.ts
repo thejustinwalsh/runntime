@@ -1,8 +1,14 @@
 /** Opt-in real-WebGPU loading and streaming through the public zoo entry. */
 
 import { expect, it } from 'vitest';
-import { createLfm3Chat, models, type RangeSource } from '../../../src/zoo/index.ts';
+import {
+  createLfm3Chat,
+  models,
+  type Lfm3Message,
+  type RangeSource,
+} from '../../../src/zoo/index.ts';
 import { gpu, liveBuffers } from '../../gpu.ts';
+import liquidReference from './liquid-reference.json';
 
 declare global {
   interface ImportMetaEnv {
@@ -16,9 +22,28 @@ declare global {
 }
 
 const MODE = import.meta.env.VITE_LFM3_QUALIFICATION_MODE;
-const MODEL_URL = import.meta.env.VITE_LFM3_MODEL_URL ?? models.lfm3.LFM3_OMNI_2B.DEFAULT.modelPath;
-const TOKENIZER_URL =
-  import.meta.env.VITE_LFM3_TOKENIZER_URL ?? models.lfm3.LFM3_OMNI_2B.DEFAULT.tokenizerPath;
+const Q4_MODE = MODE === 'q4';
+const MODEL_CONFIG = Q4_MODE ? models.lfm3.LFM3_OMNI_2B.Q4_K_M : models.lfm3.LFM3_OMNI_2B.DEFAULT;
+const MODEL_URL = import.meta.env.VITE_LFM3_MODEL_URL ?? MODEL_CONFIG.modelPath;
+const TOKENIZER_URL = import.meta.env.VITE_LFM3_TOKENIZER_URL ?? MODEL_CONFIG.tokenizerPath;
+const REFERENCE_CASES = [
+  {
+    id: 'arithmetic',
+    messages: [{ role: 'user', content: 'What is 6 times 7? Reply with only the number.' }],
+  },
+  {
+    id: 'capital',
+    messages: [
+      { role: 'user', content: 'What is the capital of France? Reply with only the city.' },
+    ],
+  },
+  {
+    id: 'color',
+    messages: [
+      { role: 'user', content: 'What color is a clear daytime sky? Reply with one word.' },
+    ],
+  },
+] satisfies readonly { id: string; messages: readonly Lfm3Message[] }[];
 
 const gpuBufferBytes = (): number =>
   [...liveBuffers()].reduce((sum, buffer) => sum + buffer.size, 0);
@@ -32,8 +57,8 @@ function hostHeapBytes(): number | null {
   return typeof bytes === 'number' ? bytes : null;
 }
 
-it.skipIf(MODE !== 'base')(
-  'loads the original checkpoint and streams text through a packed public consumer',
+it.skipIf(MODE !== 'base' && MODE !== 'q4')(
+  `loads the ${MODE === 'q4' ? 'published Q4_K_M GGUF' : 'original checkpoint'} and streams text through a packed public consumer`,
   async (ctx) => {
     await gpu();
     const before = liveBuffers();
@@ -42,14 +67,14 @@ it.skipIf(MODE !== 'base')(
     loadController.abort('qualification checks pre-abort');
     await expect(
       createLfm3Chat(
-        { ...models.lfm3.LFM3_OMNI_2B.DEFAULT, modelPath: invalidSource },
+        { ...MODEL_CONFIG, modelPath: invalidSource },
         { signal: loadController.signal },
       ),
     ).rejects.toMatchObject({ code: 'LOAD_ABORTED' });
 
     await expect(
       createLfm3Chat(
-        { modelPath: invalidSource, tokenizerPath: TOKENIZER_URL },
+        { ...MODEL_CONFIG, modelPath: invalidSource, tokenizerPath: TOKENIZER_URL },
         { cacheId: 'lfm3-invalid' },
       ),
     ).rejects.toMatchObject({ code: 'LOAD_FAILED' });
@@ -81,9 +106,9 @@ it.skipIf(MODE !== 'base')(
     let peakJsHeapBytes = hostHeapBytes();
     const loadStarted = performance.now();
     const session = await createLfm3Chat(
-      { ...models.lfm3.LFM3_OMNI_2B.DEFAULT, modelPath: source, tokenizerPath: TOKENIZER_URL },
+      { ...MODEL_CONFIG, modelPath: source, tokenizerPath: TOKENIZER_URL },
       {
-        cacheId: 'lfm3-original-base-21d75123',
+        cacheId: MODE === 'q4' ? 'lfm3-omni-q4km-public-3d29af2a' : 'lfm3-original-base-21d75123',
         onProgress(_name, done, total) {
           progressDone = done;
           progressTotal = total;
@@ -100,9 +125,12 @@ it.skipIf(MODE !== 'base')(
     peakGpuBytes = Math.max(peakGpuBytes, loadedGpuBytes);
     if (hostBytes !== null) peakJsHeapBytes = Math.max(peakJsHeapBytes ?? 0, hostBytes);
 
-    const request = async (content: string): Promise<{ text: string; latencyMs: number }> => {
+    const request = async (
+      content: string,
+      maxNewTokens = 24,
+    ): Promise<{ text: string; latencyMs: number }> => {
       const started = performance.now();
-      const generation = session.generate([{ role: 'user', content }], { maxNewTokens: 24 });
+      const generation = session.generate([{ role: 'user', content }], { maxNewTokens });
       let streamed = '';
       for await (const delta of generation) streamed += delta;
       const result = await generation.result;
@@ -118,6 +146,19 @@ it.skipIf(MODE !== 'base')(
     const second = await request('Say goodbye in one short sentence.');
     expect(first.text.trim().length).toBeGreaterThan(0);
     expect(second.text.trim().length).toBeGreaterThan(0);
+    const referenceAnswers: { id: string; answer: string }[] = [];
+    if (Q4_MODE) {
+      for (const testCase of REFERENCE_CASES) {
+        const fixture = liquidReference.fixtures.find((entry) => entry.id === testCase.id);
+        if (!fixture) throw new Error(`Liquid reference fixture '${testCase.id}' is missing`);
+        const result = await request(
+          testCase.messages[0]!.content,
+          fixture.generatedTokenIds.length,
+        );
+        expect(result.text.trim()).toBe(fixture.answer.trim());
+        referenceAnswers.push({ id: testCase.id, answer: result.text.trim() });
+      }
+    }
     const abortController = new AbortController();
     const cancelled = session.generate([{ role: 'user', content: 'Write a short greeting.' }], {
       maxNewTokens: 24,
@@ -133,7 +174,11 @@ it.skipIf(MODE !== 'base')(
     await session.dispose();
     const remainingBuffers = [...liveBuffers()].filter((buffer) => !before.has(buffer));
     const report = {
-      checkpointRevision: '21d75123f86c1f7ffb4bef1ea202710c4e7ebe67',
+      checkpointRevision:
+        MODE === 'q4'
+          ? '3d29af2ad166f8299c2d820937e47dc0add20ffc'
+          : '21d75123f86c1f7ffb4bef1ea202710c4e7ebe67',
+      modelFormat: Q4_MODE ? 'gguf' : 'safetensors',
       rangeSource: true,
       bytesRead: sourceBytes,
       progressDone,
@@ -143,6 +188,7 @@ it.skipIf(MODE !== 'base')(
       secondGenerationMs: +second.latencyMs.toFixed(2),
       firstText: first.text,
       secondText: second.text,
+      liquidReferenceAnswers: referenceAnswers,
       recoveredTextAfterCancellation: recovered.text,
       gpuBuffersAfterLoadBytes: loadedGpuBytes,
       peakGpuBuffersBytes: peakGpuBytes,

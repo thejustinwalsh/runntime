@@ -3,11 +3,15 @@
 import {
   defaultRoot,
   evalValues,
+  fromGguf,
   gpuExecutor,
+  httpRangeSource,
+  inGpuErrorScopes,
   isRunntimeError,
   RunntimeError,
   toArray,
   warmUp,
+  type RangeSource,
   type Value,
 } from '../../../core/index.ts';
 import { asLoadError, rethrowRunError } from '../../errors.ts';
@@ -19,6 +23,7 @@ import {
   type ModelPath,
 } from '../../load.ts';
 import { models } from '../../models.ts';
+import { LFM3_Q4_K_M_SOURCE } from '../../lfm3/gguf.ts';
 import { cacheValues, Lfm3CausalLM, type Lfm3Cache } from '../../lfm3/model.ts';
 import {
   createLfm3Session,
@@ -28,12 +33,15 @@ import {
 import { createLfm3Tokenizer, LFM3_REVISION, LFM3_TOKENIZER_URL } from '../../lfm3/tokenizer.ts';
 
 const MODEL_URL = `https://huggingface.co/LiquidAI/LFM3-Omni-2B/resolve/${LFM3_REVISION}/model.safetensors`;
+const GGUF_CACHE_PREFIX = 'lfm3-omni-q4km-v1';
 
 export interface Lfm3ChatModel {
-  /** Original BF16 safetensors checkpoint, or caller-owned RangeSource. */
+  /** Original BF16 safetensors or the pinned Q4_K_M GGUF, or a caller-owned RangeSource. */
   readonly modelPath?: ModelPath;
   /** Pinned Liquid tokenizer.json. */
   readonly tokenizerPath?: string;
+  /** Selects the pinned GGUF reader instead of the original safetensors loader. */
+  readonly format?: 'gguf';
 }
 
 export type {
@@ -49,7 +57,8 @@ export async function createLfm3Chat(
   config: Lfm3ChatModel = models.lfm3.LFM3_OMNI_2B.DEFAULT,
   opts: LoadOptions = {},
 ): Promise<Lfm3ChatSession> {
-  const modelPath = config.modelPath ?? MODEL_URL;
+  const modelPath =
+    config.modelPath ?? (config.format === 'gguf' ? LFM3_Q4_K_M_SOURCE.url : MODEL_URL);
   const tokenizerPath = config.tokenizerPath ?? LFM3_TOKENIZER_URL;
   const root = defaultRoot();
   const executor = gpuExecutor(root);
@@ -70,17 +79,28 @@ export async function createLfm3Chat(
             cause: signal.reason,
           });
         }
-        step = model.forward(ids, root, previous);
-        evalValues([step.logits, ...cacheValues(step.cache)], executor);
-        const logits = await toArray(step.logits, executor);
-        await releaseAfterWork();
-        if (signal.aborted) {
-          throw new RunntimeError('EXECUTION_FAILED', 'LFM3 generation aborted', {
-            cause: signal.reason,
-          });
-        }
-        executor.releaseValues([step.logits]);
-        return { logits, cache: step.cache };
+        const result = await inGpuErrorScopes(root.device, 'LFM3 generation', async () => {
+          const current = model.forward(ids, root, previous);
+          step = current;
+          evalValues([current.logits, ...cacheValues(current.cache)], executor);
+          const logits = await toArray(current.logits, executor);
+          await releaseAfterWork();
+          if (signal.aborted) {
+            throw new RunntimeError('EXECUTION_FAILED', 'LFM3 generation aborted', {
+              cause: signal.reason,
+            });
+          }
+          if (
+            logits.length === 0 ||
+            !logits.every(Number.isFinite) ||
+            logits.every((value) => value === 0)
+          ) {
+            throw new RunntimeError('EXECUTION_FAILED', 'LFM3 generation produced unusable logits');
+          }
+          return { logits, step: current };
+        });
+        executor.releaseValues([result.step.logits]);
+        return { logits: result.logits, cache: result.step.cache };
       } catch (error) {
         await releaseAfterWork();
         if (step) executor.releaseValues([step.logits, ...cacheValues(step.cache)]);
@@ -108,10 +128,13 @@ export async function createLfm3Chat(
   let tokenizer: ReturnType<typeof createLfm3Tokenizer> | undefined;
   try {
     throwIfAborted(opts.signal);
-    const weights = await openWeights(modelPath, {
-      ...opts,
-      cacheId: opts.cacheId ?? cacheKey(modelPath),
-    });
+    const weights =
+      config.format === 'gguf'
+        ? await openGgufWeights(modelPath, opts)
+        : await openWeights(modelPath, {
+            ...opts,
+            cacheId: opts.cacheId ?? cacheKey(modelPath),
+          });
     const tokenizerJson = await fetchJson<unknown>(tokenizerPath, {
       cache: opts.cache,
       cacheId: cacheKey(tokenizerPath),
@@ -130,16 +153,28 @@ export async function createLfm3Chat(
     throwIfAborted(opts.signal);
 
     if (opts.warmUp !== false) {
-      await warmUp(
-        root.device,
-        async () => {
-          const prompt = tokenizer!.encodeChat([{ role: 'user', content: 'Hello.' }]);
-          const result = await runtime.forward(prompt, undefined, new AbortController().signal);
-          await runtime.release(result.cache);
-          return result.logits;
-        },
-        'LFM3 model warm-up',
-      );
+      try {
+        await warmUp(
+          root.device,
+          async () => {
+            throwIfAborted(opts.signal);
+            const prompt = tokenizer!.encodeChat([{ role: 'user', content: 'Hello.' }]);
+            const result = await runtime.forward(
+              prompt,
+              undefined,
+              opts.signal ?? new AbortController().signal,
+            );
+            await runtime.release(result.cache);
+            throwIfAborted(opts.signal);
+            return result.logits;
+          },
+          'LFM3 model warm-up',
+        );
+      } catch (error) {
+        throwIfAborted(opts.signal);
+        throw error;
+      }
+      throwIfAborted(opts.signal);
       runtime.trim();
     }
 
@@ -155,6 +190,20 @@ export async function createLfm3Chat(
   }
 }
 
+async function openGgufWeights(modelPath: ModelPath, opts: LoadOptions) {
+  const source: RangeSource =
+    typeof modelPath === 'string'
+      ? httpRangeSource(modelPath, { onBytes: opts.onBytes })
+      : modelPath;
+  return fromGguf(source, {
+    fileBytes: LFM3_Q4_K_M_SOURCE.bytes,
+    sha256: LFM3_Q4_K_M_SOURCE.sha256,
+    cache: opts.cache,
+    cacheId: opts.cacheId ?? ggufCacheKey(modelPath),
+    signal: opts.signal,
+  });
+}
+
 function destroyUploads(values: readonly Value[]): void {
   for (const value of values) {
     if (value.state === 'materialized') value.buffer.destroy();
@@ -163,3 +212,6 @@ function destroyUploads(values: readonly Value[]): void {
 
 const cacheKey = (path: ModelPath): string | undefined =>
   typeof path === 'string' ? `lfm3-base-v1/${path.replace(/^https?:\/\//, '')}` : undefined;
+
+const ggufCacheKey = (path: ModelPath): string | undefined =>
+  typeof path === 'string' ? `${GGUF_CACHE_PREFIX}/${path.replace(/^https?:\/\//, '')}` : undefined;

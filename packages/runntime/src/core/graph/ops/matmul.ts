@@ -21,6 +21,7 @@ export interface MatmulOpts {
   activation?: SlotAct;
   baseRow?: number;
   scales?: Value;
+  offsets?: Value;
   scaleBase?: number;
   bits?: 8 | 4;
   groupSize?: number;
@@ -34,7 +35,7 @@ export interface MatmulOpts {
  *  epilogue only as a whole weight. */
 export function matmul(a: Value, b: Value, opts: MatmulOpts = {}): Value {
   if (b.shape.dtype === 'quantW') {
-    const { scales, bits, groupSize } = opts;
+    const { scales, bits, groupSize, offsets } = opts;
     if (!scales || !bits || !groupSize) {
       throw new Error('matmul: quantW weights need scales, bits and groupSize');
     }
@@ -43,13 +44,14 @@ export function matmul(a: Value, b: Value, opts: MatmulOpts = {}): Value {
       scaleBase: opts.scaleBase ?? 0,
       bits,
       groupSize,
+      offsets,
       bias: opts.bias,
       addend: opts.addend,
       activation: opts.activation,
     });
   }
-  if (opts.scales || opts.bits || opts.groupSize) {
-    throw new Error('matmul: scales/bits/groupSize apply to quantW weights only');
+  if (opts.scales || opts.offsets || opts.bits || opts.groupSize) {
+    throw new Error('matmul: scales/offsets/bits/groupSize apply to quantW weights only');
   }
   const ad = a.shape.dims;
   const bd = b.shape.dims;
@@ -108,6 +110,7 @@ function matmulQuantW(
     scaleBase: number;
     bits: 8 | 4;
     groupSize: number;
+    offsets?: Value;
     bias?: Value;
     addend?: Value;
     activation?: SlotAct;
@@ -120,7 +123,10 @@ function matmulQuantW(
   }
   if (scales.shape.dtype !== 'f32') throw new Error('matmul: scales must be f32');
   const [r, n] = [wd[0]!, wd[1]!];
-  const { baseRow, scaleBase, bits, groupSize } = opts;
+  const { baseRow, scaleBase, bits, groupSize, offsets } = opts;
+  if (offsets && (offsets.shape.dtype !== 'f32' || offsets.shape.elems !== scales.shape.elems)) {
+    throw new Error('matmul: offsets must be f32 and match scales');
+  }
   if (bits !== 8 && bits !== 4) throw new Error(`matmul: bits must be 8 or 4, got ${bits}`);
   const perU32 = bits === 8 ? 4 : 8;
   if (n % perU32 !== 0)
@@ -178,13 +184,21 @@ function matmulQuantW(
   return pending(
     { elems: m * n, dtype, dims: [m, n] },
     'matmulQuantW',
-    [a, w, scales, ...(bias ? [bias] : []), ...(addend ? [addend] : [])],
+    [
+      a,
+      w,
+      scales,
+      ...(offsets ? [offsets] : []),
+      ...(bias ? [bias] : []),
+      ...(addend ? [addend] : []),
+    ],
     undefined,
     [
       baseRow,
       scaleBase,
       bits,
       groupSize,
+      offsets ? 1 : 0,
       bias ? 1 : 0,
       addend ? 1 : 0,
       activation ? ACT_CODE[activation] : 0,

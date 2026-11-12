@@ -49,6 +49,7 @@ export interface MatmulQuantCfg {
   n: number;
   bits: number;
   groupSize: number;
+  hasOffset: number;
   hasBias: number;
   hasAdd: number;
   act?: number;
@@ -59,6 +60,7 @@ export interface MatmulQuantBuffers {
   a: FloatBuffer;
   w: U32Buffer;
   scales: F32Buffer;
+  offsets?: F32Buffer;
   out: FloatBuffer;
   bias?: FloatBuffer;
   addend?: FloatBuffer;

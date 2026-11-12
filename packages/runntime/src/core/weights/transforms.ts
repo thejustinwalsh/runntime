@@ -162,6 +162,16 @@ export function concatRows(parts: readonly LazyTensor[]): LazyTensor {
         return out;
       },
       scales: async () => stackFloats(await readEachOnce(quant, (p) => p.scales())),
+      offsets: quant.some((p) => p.offsets)
+        ? async () =>
+            stackFloats(
+              await readEachOnce(quant, (p) =>
+                p.offsets
+                  ? p.offsets()
+                  : Promise.resolve(new Float32Array(numel(p.shape) / p.groupSize)),
+              ),
+            )
+        : undefined,
     });
   }
   return derivedTensor(
@@ -182,6 +192,7 @@ export function splitRows(t: LazyTensor, sizes: readonly number[]): LazyTensor[]
   if (t.kind === 'quant') {
     const ints = sharedRead(() => t.ints(), sizes.length);
     const scales = sharedRead(() => t.scales(), sizes.length);
+    const offsets = t.offsets ? sharedRead(() => t.offsets!(), sizes.length) : undefined;
     const scaleRowElems = rowElems / t.groupSize;
     let start = 0;
     return sizes.map((rows) => {
@@ -196,6 +207,10 @@ export function splitRows(t: LazyTensor, sizes: readonly number[]): LazyTensor[]
         ints: async () => (await ints()).slice(first * rowElems, (first + rows) * rowElems),
         scales: async () =>
           (await scales()).slice(first * scaleRowElems, (first + rows) * scaleRowElems),
+        offsets: offsets
+          ? async () =>
+              (await offsets()).slice(first * scaleRowElems, (first + rows) * scaleRowElems)
+          : undefined,
       });
     });
   }
@@ -232,6 +247,7 @@ export function splitCols(t: LazyTensor, sizes: readonly number[]): LazyTensor[]
     }
     const ints = sharedRead(() => t.ints(), sizes.length);
     const scales = sharedRead(() => t.scales(), sizes.length);
+    const offsets = t.offsets ? sharedRead(() => t.offsets!(), sizes.length) : undefined;
     let start = 0;
     return sizes.map((cols) => {
       const from = start;
@@ -248,6 +264,18 @@ export function splitCols(t: LazyTensor, sizes: readonly number[]): LazyTensor[]
           const out = allocLike(data, (rows * cols) / groupSize);
           return copyCols(data, out, width / groupSize, from / groupSize, cols / groupSize);
         },
+        offsets: offsets
+          ? async () => {
+              const data = await offsets();
+              return copyCols(
+                data,
+                allocLike(data, (rows * cols) / groupSize),
+                width / groupSize,
+                from / groupSize,
+                cols / groupSize,
+              );
+            }
+          : undefined,
       });
     });
   }
@@ -293,6 +321,12 @@ export function permuteRows(t: LazyTensor, order: readonly number[]): LazyTensor
         const data = await t.scales();
         return reorderRows(data, allocLike(data, data.length), order, rowElems / t.groupSize);
       },
+      offsets: t.offsets
+        ? async () => {
+            const data = await t.offsets!();
+            return reorderRows(data, new Float32Array(data.length), order, rowElems / t.groupSize);
+          }
+        : undefined,
     });
   }
   return derivedTensor(
@@ -328,6 +362,9 @@ export function scaleWeight(t: LazyTensor, scale: number | readonly number[]): L
       ...t,
       name: `scaleWeight(${t.name})`,
       scales: async () => scaled(toF32(await t.scales()), rowElems / t.groupSize),
+      offsets: t.offsets
+        ? async () => scaled(toF32(await t.offsets!()), rowElems / t.groupSize)
+        : undefined,
     });
   }
   return derivedTensor(

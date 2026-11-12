@@ -17,8 +17,10 @@ declare global {
 }
 
 const MODE = import.meta.env.VITE_LFM3_QUALIFICATION_MODE;
+const Q4_MODE = MODE === 'q4-recovery';
+const MODEL_CONFIG = Q4_MODE ? models.lfm3.LFM3_OMNI_2B.Q4_K_M : models.lfm3.LFM3_OMNI_2B.DEFAULT;
 const CONFIG = {
-  ...models.lfm3.LFM3_OMNI_2B.DEFAULT,
+  ...MODEL_CONFIG,
   ...(import.meta.env.VITE_LFM3_MODEL_URL
     ? { modelPath: import.meta.env.VITE_LFM3_MODEL_URL }
     : {}),
@@ -27,7 +29,7 @@ const CONFIG = {
     : {}),
 };
 
-it.skipIf(MODE !== 'recovery')(
+it.skipIf(MODE !== 'recovery' && MODE !== 'q4-recovery')(
   'recovers with a new public LFM3 session after real WebGPU device loss',
   async (ctx) => {
     const { root: lostRoot } = await gpu();
@@ -80,7 +82,11 @@ it.skipIf(MODE !== 'recovery')(
 
     console.info(
       `LFM3_DEVICE_RECOVERY ${JSON.stringify({
-        checkpointRevision: '21d75123f86c1f7ffb4bef1ea202710c4e7ebe67',
+        checkpointRevision:
+          MODE === 'q4-recovery'
+            ? '3d29af2ad166f8299c2d820937e47dc0add20ffc'
+            : '21d75123f86c1f7ffb4bef1ea202710c4e7ebe67',
+        modelFormat: Q4_MODE ? 'gguf' : 'safetensors',
         deviceLossReason: lostInfo.reason,
         firstLoadMs: +firstLoadMs.toFixed(2),
         failedSessionError: 'generation rejected after GPUDevice.destroy()',

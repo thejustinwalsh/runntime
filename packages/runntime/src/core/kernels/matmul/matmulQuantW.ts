@@ -33,6 +33,7 @@ function makeLayout(elem: Elem) {
     a: { storage: d.arrayOf(elem.vec4), access: 'readonly' }, // [M, K/4]
     w: { storage: d.arrayOf(d.u32), access: 'readonly' },
     scales: { storage: d.arrayOf(d.vec4f), access: 'readonly' }, // [.., N/4]
+    offsets: { storage: d.arrayOf(d.vec4f), access: 'readonly' }, // [.., N/4]; dead when hasOffset=0
     bias: { storage: d.arrayOf(elem.vec4), access: 'readonly' }, // [N/4]; dead when hasBias=0
     addend: { storage: d.arrayOf(elem.vec4), access: 'readonly' }, // [M, N/4]; dead when hasAdd=0
     out: { storage: d.arrayOf(elem.vec4), access: 'mutable' },
@@ -68,7 +69,7 @@ const SLICE_STRIDES = Array.from(
 const partial = tgpu.workgroupVar(d.arrayOf(d.vec4f, ROWS * LANES));
 
 function makeMatmulQuantWKernel(cfg: MatmulQuantCfg, elem: Elem) {
-  const { k, n, bits, groupSize, hasBias, hasAdd } = cfg;
+  const { k, n, bits, groupSize, hasOffset, hasBias, hasAdd } = cfg;
   const layout = layoutFor(elem);
   const storeVec4 = elem.vec4;
   const k4 = k / 4;
@@ -105,13 +106,20 @@ function makeMatmulQuantWKernel(cfg: MatmulQuantCfg, elem: Elem) {
         const c1 = deqVec4(layout.$.w[tb + cw1]!, (4 * bits) % 32, bits);
         const c2 = deqVec4(layout.$.w[tb + cw2]!, (8 * bits) % 32, bits);
         const c3 = deqVec4(layout.$.w[tb + cw3]!, (12 * bits) % 32, bits);
-        const s = layout.$.scales[sBase + std.intdiv(i * 4, groupSize) * n4]!;
+        const group = std.intdiv(i * 4, groupSize);
+        const scale = layout.$.scales[sBase + group * n4]!;
+        let offset = d.vec4f();
+        if (hasOffset > 0) {
+          offset = d.vec4f(layout.$.offsets[sBase + group * n4]!);
+        }
         for (const r of tgpu.unroll(std.range(ROWS))) {
           if (row0 + r < D.m) {
             const x = d.vec4f(layout.$.a[(row0 + r) * k4 + i]!);
+            const sum = x.x + x.y + x.z + x.w;
             accs[r] =
               accs[r]! +
-              d.vec4f(std.dot(x, c0), std.dot(x, c1), std.dot(x, c2), std.dot(x, c3)) * s;
+              d.vec4f(std.dot(x, c0), std.dot(x, c1), std.dot(x, c2), std.dot(x, c3)) * scale +
+              offset * sum;
           }
         }
       }
@@ -176,6 +184,7 @@ export function matmulQuantWHandle(
   // Absent epilogue operands alias `a`; those pipelines never read them.
   const bindGroup = cachedBindGroup(root, layoutFor(elem), {
     ...buffers,
+    offsets: buffers.offsets ?? buffers.scales,
     bias: buffers.bias ?? buffers.a,
     addend: buffers.addend ?? buffers.a,
     dims,

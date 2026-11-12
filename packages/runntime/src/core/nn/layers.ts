@@ -70,18 +70,39 @@ export class Embedding extends Module<[readonly number[] | Value, TgpuRoot?], Va
       throw new Error('Embedding.gather: cpu-resident tables only');
     }
     const { numEmbeddings: vocab, embeddingDim: dim } = this;
-    const table = this.weight.data;
+    const quantized = this.weight.quantizedData;
+    const table = quantized ? undefined : this.weight.data;
     const out = new Float32Array(tokenIds.length * dim);
     const u32 = new Uint32Array(out.buffer);
+    const quantScales = quantized
+      ? quantized.scales instanceof Float32Array
+        ? quantized.scales
+        : f16ToF32(quantized.scales)
+      : undefined;
+    const quantOffsets = quantized?.offsets
+      ? quantized.offsets instanceof Float32Array
+        ? quantized.offsets
+        : f16ToF32(quantized.offsets)
+      : undefined;
     tokenIds.forEach((id, t) => {
       if (!Number.isInteger(id) || id < 0 || id >= vocab) {
         throw new Error(`Embedding: token id ${id} out of range (vocab ${vocab})`);
       }
       const base = id * dim;
-      if (table instanceof Float32Array) {
+      if (quantized) {
+        if (!quantScales) throw new Error('Embedding.gather: invalid quantized table');
+        for (let i = 0; i < dim; i++) {
+          const group = Math.floor(i / quantized.groupSize);
+          const index = id * (dim / quantized.groupSize) + group;
+          out[t * dim + i] =
+            quantized.ints[base + i]! * quantScales[index]! + (quantOffsets?.[index] ?? 0);
+        }
+      } else if (table instanceof Float32Array) {
         out.set(table.subarray(base, base + dim), t * dim);
-      } else {
+      } else if (table instanceof Uint16Array) {
         for (let i = 0; i < dim; i++) u32[t * dim + i] = table[base + i]! << 16;
+      } else {
+        throw new Error('Embedding.gather: table is not loaded');
       }
     });
     return out;
@@ -122,6 +143,8 @@ export class Linear extends Module {
   readonly activation?: SlotAct;
   /** Set when a quantized weight loads. */
   weightScale?: Parameter;
+  /** Per-group affine term set by an asymmetric quantized weight. */
+  weightOffset?: Parameter;
   /** How the loaded weight is quantized, or undefined for a float weight. */
   private quantization?: { bits: 4 | 8; groupSize: number };
   constructor(
@@ -188,6 +211,24 @@ export class Linear extends Module {
       undefined,
       true,
     );
+    const offsetData = tensor.offsets
+      ? derivedTensor([k / groupSize, n], async () => {
+          const data = await tensor.offsets!();
+          const f32 = data instanceof Float32Array ? data : f16ToF32(data);
+          const out = new Float32Array(f32.length);
+          for (let o = 0; o < n; o++) {
+            for (let g = 0; g < groups; g++) out[g * n + o] = f32[o * groups + g]!;
+          }
+          return out;
+        })
+      : undefined;
+    this.weightOffset = offsetData
+      ? new Parameter(
+          { elems: (k / groupSize) * n, dtype: 'f32', dims: [k / groupSize, n] },
+          undefined,
+          true,
+        )
+      : undefined;
     const words = derivedTensor(
       [k, n],
       async () => packQuantW(await tensor.ints(), k, n, bits),
@@ -205,11 +246,15 @@ export class Linear extends Module {
       return out;
     });
     const scaleName = prefix ? `${prefix}.weightScale` : 'weightScale';
+    const offsetName = prefix ? `${prefix}.weightOffset` : 'weightOffset';
     const entries = [...sd.tensors];
     sd.tensors.clear();
     for (const [key, t] of entries) {
       sd.tensors.set(key, key === name ? words : t);
-      if (key === name) sd.tensors.set(scaleName, scales);
+      if (key === name) {
+        sd.tensors.set(scaleName, scales);
+        if (offsetData) sd.tensors.set(offsetName, offsetData);
+      }
     }
   }
   forward(x: Value, call: { addend?: Value } = {}): Value {
@@ -218,6 +263,7 @@ export class Linear extends Module {
     }
     return matmul(x, this.weight.value, {
       scales: this.weightScale.value,
+      offsets: this.weightOffset?.value,
       ...this.quantization,
       bias: this.bias?.value,
       addend: call.addend,

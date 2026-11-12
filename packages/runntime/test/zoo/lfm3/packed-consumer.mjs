@@ -1,6 +1,8 @@
 /** Builds the package tarball and runs its public LFM3 loader on real WebGPU. */
 
 import {
+  copyFileSync,
+  existsSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -11,6 +13,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -19,14 +22,15 @@ import { spawnSync } from 'node:child_process';
 const scriptDirectory = dirname(fileURLToPath(import.meta.url));
 const packageDirectory = resolve(scriptDirectory, '../../..');
 const repositoryDirectory = resolve(packageDirectory, '../..');
-const modelUrl = process.env.LFM3_BASE_MODEL_URL;
+const modelUrl =
+  process.env.LFM3_MODEL_URL ?? process.env.LFM3_BASE_MODEL_URL ?? process.env.LFM3_Q4_MODEL_URL;
 const tokenizerUrl = process.env.LFM3_BASE_TOKENIZER_URL;
 const reportPath = process.env.LFM3_BASE_VITEST_REPORT;
 const qualificationMode = process.env.LFM3_BASE_QUALIFICATION_MODE ?? 'base';
-
-if (!modelUrl) {
-  throw new Error('set LFM3_BASE_MODEL_URL to the pinned original model.safetensors URL');
-}
+const liquidEnginePath = process.env.LFM3_LIQUID_ENGINE_PATH;
+const liquidReferenceOutput = process.env.LFM3_LIQUID_REFERENCE_OUTPUT;
+const packedTestFile = process.env.LFM3_PACKED_TEST_FILE;
+const keepTemporaryDirectory = process.env.LFM3_KEEP_PACKED_TEMP === '1';
 
 const temporaryDirectory = mkdtempSync(join(tmpdir(), 'runntime-packed-lfm3-'));
 
@@ -75,6 +79,10 @@ try {
 
   const testDirectory = join(consumerDirectory, 'test', 'zoo', 'lfm3');
   mkdirSync(testDirectory, { recursive: true });
+  copyFileSync(
+    join(packageDirectory, 'test/zoo/lfm3/liquid-reference.json'),
+    join(testDirectory, 'liquid-reference.json'),
+  );
   const qualificationSource = readFileSync(
     join(packageDirectory, 'test/zoo/lfm3/public.gpu.test.ts'),
     'utf8',
@@ -88,6 +96,35 @@ try {
     'utf8',
   ).replace("from '../../../src/zoo/index.ts'", "from 'runntime/zoo'");
   writeFileSync(join(testDirectory, 'recovery.gpu.test.ts'), recoverySource);
+  const referenceSource = readFileSync(
+    join(packageDirectory, 'test/zoo/lfm3/liquid-reference.gpu.test.ts'),
+    'utf8',
+  );
+  writeFileSync(join(testDirectory, 'liquid-reference.gpu.test.ts'), referenceSource);
+  if (qualificationMode === 'liquid-reference') {
+    if (!liquidEnginePath)
+      throw new Error('set LFM3_LIQUID_ENGINE_PATH to the pinned Liquid engine bundle');
+    const engineBytes = readFileSync(liquidEnginePath);
+    const engineDigest = createHash('sha256').update(engineBytes).digest('hex');
+    const expectedEngineDigest = '77821949412f5dd6d60e37f22415f0e71454e65f6a73928529c6fbec0f2cf2cb';
+    if (engineDigest !== expectedEngineDigest) {
+      throw new Error(
+        `Liquid engine SHA-256 ${engineDigest} does not match ${expectedEngineDigest}`,
+      );
+    }
+    const engineSource = engineBytes.toString('utf8');
+    const accessor = 'get generation_config(){return this.#e.generation_config}';
+    if (engineSource.split(accessor).length !== 2) {
+      throw new Error('pinned Liquid engine wrapper did not match the reference accessor location');
+    }
+    const instrumentation = 'get reference(){return this.#e}';
+    const instrumented = engineSource.replace(accessor, `${instrumentation}${accessor}`);
+    writeFileSync(join(testDirectory, 'liquid-reference-engine.js'), instrumented);
+    console.info(`LFM3_LIQUID_ENGINE_SHA256 ${engineDigest}`);
+    console.info(
+      `LFM3_LIQUID_ENGINE_INSTRUMENTATION_SHA256 ${createHash('sha256').update(instrumentation).digest('hex')}`,
+    );
+  }
   writeFileSync(
     join(consumerDirectory, 'test/gpu.ts'),
     `/** Real WebGPU setup and buffer-lifetime observation for the packed consumer. */
@@ -145,9 +182,24 @@ export function gpu() {
     `import { playwright } from '@vitest/browser-playwright';
 import typegpu from 'unplugin-typegpu/vite';
 import { defineConfig } from 'vitest/config';
+import { writeFileSync } from 'node:fs';
 
 export default defineConfig({
-  plugins: [typegpu()],
+  plugins: [typegpu(), {
+    name: 'liquid-reference-capture',
+    configureServer(server) {
+      server.middlewares.use('/__liquid-reference-fixture', (request, response) => {
+        if (request.method !== 'POST') { response.statusCode = 405; response.end(); return; }
+        const chunks = [];
+        request.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
+        request.on('end', () => {
+          writeFileSync(${JSON.stringify(join(temporaryDirectory, 'liquid-reference-fixture.json'))}, Buffer.concat(chunks));
+          response.statusCode = 204;
+          response.end();
+        });
+      });
+    },
+  }],
   optimizeDeps: { include: ['typegpu'] },
   server: { fs: { allow: [${JSON.stringify(repositoryDirectory)}, ${JSON.stringify(temporaryDirectory)}] } },
   test: {
@@ -167,10 +219,17 @@ export default defineConfig({
   const env = {
     ...process.env,
     VITE_LFM3_QUALIFICATION_MODE: qualificationMode,
-    VITE_LFM3_MODEL_URL: modelUrl,
-    VITE_LFM3_TOKENIZER_URL:
-      tokenizerUrl ??
-      'https://huggingface.co/LiquidAI/LFM3-Omni-2B/resolve/21d75123f86c1f7ffb4bef1ea202710c4e7ebe67/tokenizer.json',
+    ...(modelUrl ? { VITE_LFM3_MODEL_URL: modelUrl } : {}),
+    ...(tokenizerUrl
+      ? { VITE_LFM3_TOKENIZER_URL: tokenizerUrl }
+      : {
+          VITE_LFM3_TOKENIZER_URL:
+            'https://huggingface.co/LiquidAI/LFM3-Omni-2B/resolve/21d75123f86c1f7ffb4bef1ea202710c4e7ebe67/tokenizer.json',
+        }),
+    ...(qualificationMode === 'liquid-reference'
+      ? { VITE_LFM3_LIQUID_ENGINE_URL: '/test/zoo/lfm3/liquid-reference-engine.js' }
+      : {}),
+    ...(liquidReferenceOutput ? { VITE_LFM3_LIQUID_REFERENCE_CAPTURE: '1' } : {}),
   };
   const vitestArgs = [
     join(nodeModules, 'vitest/vitest.mjs'),
@@ -185,7 +244,14 @@ export default defineConfig({
       `--outputFile.json=${resolve(reportPath)}`,
     );
   }
+  if (packedTestFile) vitestArgs.push(packedTestFile);
   run(process.execPath, vitestArgs, consumerDirectory, env);
+  if (liquidReferenceOutput) {
+    const capturedFixture = join(temporaryDirectory, 'liquid-reference-fixture.json');
+    if (!existsSync(capturedFixture)) throw new Error('Liquid reference fixture was not captured');
+    copyFileSync(capturedFixture, resolve(liquidReferenceOutput));
+  }
 } finally {
-  rmSync(temporaryDirectory, { recursive: true, force: true });
+  if (keepTemporaryDirectory) console.info(`LFM3_PACKED_TEMP ${temporaryDirectory}`);
+  else rmSync(temporaryDirectory, { recursive: true, force: true });
 }

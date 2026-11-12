@@ -83,6 +83,8 @@ export interface Lfm3Cache {
 
 /** Logits, next-token cache and caller-owned transient uploads for one forward. */
 export interface Lfm3ModelStep {
+  /** Final normalized hidden states, one row per input token. */
+  readonly hidden: Value;
   readonly logits: Value;
   readonly cache: Lfm3Cache;
   /** Caller-owned embeddings and rotary tables, released after evaluation. */
@@ -103,6 +105,114 @@ const projectionOrder = (heads: number): number[] => {
 const Q_ORDER = projectionOrder(LFM3.heads);
 const K_ORDER = projectionOrder(LFM3.kvHeads);
 const NORM_ORDER = projectionOrder(1);
+
+const GGUF_LAYER_NAMES: Record<string, string> = {
+  'attn_gate.weight': 'self_attn.gate_proj.weight',
+  'attn_k.weight': 'self_attn.k_proj.weight',
+  'attn_k_norm.weight': 'self_attn.k_norm.weight',
+  'attn_norm.weight': 'operator_norm.weight',
+  'attn_output.weight': 'self_attn.o_proj.weight',
+  'attn_q.weight': 'self_attn.q_proj.weight',
+  'attn_q_norm.weight': 'self_attn.q_norm.weight',
+  'attn_v.weight': 'self_attn.v_proj.weight',
+  'ffn_down.weight': 'feed_forward.w2.weight',
+  'ffn_gate.weight': 'feed_forward.w1.weight',
+  'ffn_norm.weight': 'ffn_norm.weight',
+  'ffn_up.weight': 'feed_forward.w3.weight',
+  'post_attention_norm.weight': 'post_operator_norm.weight',
+  'post_ffw_norm.weight': 'post_ffn_norm.weight',
+  'shortconv.conv.weight': 'conv.conv.weight',
+  'shortconv.in_proj.weight': 'conv.in_proj.weight',
+  'shortconv.out_proj.weight': 'conv.out_proj.weight',
+};
+
+function validateGgufMetadata(metadata: Record<string, unknown>): void {
+  const bad = (why: string): never => {
+    throw checkpointMismatch('LFM3 GGUF', why);
+  };
+  if (metadata['general.architecture'] !== 'lfm3') bad('expected general.architecture=lfm3');
+
+  const numbers: Record<string, number> = {
+    'general.file_type': 15,
+    'general.quantization_version': 2,
+    'lfm3.block_count': LFM3.layers,
+    'lfm3.context_length': LFM3.maxContext,
+    'lfm3.embedding_length': LFM3.hidden,
+    'lfm3.feed_forward_length': LFM3.ffn,
+    'lfm3.attention.head_count': LFM3.heads,
+    'lfm3.rope.freq_base': LFM3.fullRopeTheta,
+    'lfm3.rope.freq_base_swa': LFM3.slidingRopeTheta,
+    'lfm3.attention.layer_norm_rms_epsilon': LFM3.eps,
+    'lfm3.attention.key_length': LFM3.headDim,
+    'lfm3.attention.value_length': LFM3.headDim,
+    'lfm3.rope.dimension_count': LFM3.headDim,
+    'lfm3.attention.sliding_window': LFM3.slidingWindow,
+    'lfm3.shortconv.l_cache': LFM3.convKernel,
+  };
+  for (const [key, expected] of Object.entries(numbers)) {
+    const actual = metadata[key];
+    if (typeof actual !== 'number' || Math.fround(actual) !== Math.fround(expected)) {
+      bad(`${key} is ${JSON.stringify(actual)}, expected ${expected}`);
+    }
+  }
+
+  const arrays: Record<string, readonly (number | boolean)[]> = {
+    'lfm3.attention.head_count_kv': LFM3.layerTypes.map((type) =>
+      type === 'conv' ? 0 : LFM3.kvHeads,
+    ),
+    'lfm3.attention.sliding_window_pattern': LFM3.layerTypes.map(
+      (type) => type === 'sliding_attention',
+    ),
+  };
+  for (const [key, expected] of Object.entries(arrays)) {
+    const actual = metadata[key];
+    if (
+      !Array.isArray(actual) ||
+      actual.length !== expected.length ||
+      actual.some((value, index) => value !== expected[index])
+    ) {
+      bad(`${key} does not match the pinned LFM3 layer layout`);
+    }
+  }
+}
+
+function mapGgufTensorName(name: string): string {
+  if (name === 'token_embd.weight') return 'model.language_model.embed_tokens.weight';
+  if (name === 'output_norm.weight') return 'model.language_model.embedding_norm.weight';
+  if (name === 'rope_freqs.weight') return '';
+
+  const match = /^blk\.(\d+)\.(.+)$/.exec(name);
+  if (!match) {
+    throw checkpointMismatch('LFM3 GGUF', `unexpected tensor '${name}'`);
+  }
+  const layer = Number(match[1]);
+  if (!Number.isInteger(layer) || layer < 0 || layer >= LFM3.layers) {
+    throw checkpointMismatch('LFM3 GGUF', `tensor '${name}' has an invalid layer index`);
+  }
+  const suffix = GGUF_LAYER_NAMES[match[2]!];
+  if (!suffix) throw checkpointMismatch('LFM3 GGUF', `unexpected tensor '${name}'`);
+  return `model.language_model.layers.${layer}.${suffix}`;
+}
+
+function mapGgufStateDict(sd: LazyStateDict): void {
+  validateGgufMetadata(sd.ggufMetadata!);
+  const rope = sd.tensors.get('rope_freqs.weight');
+  if (!rope || rope.kind !== 'derived' || rope.shape.join() !== '64') {
+    throw checkpointMismatch('LFM3 GGUF', 'rope_freqs.weight must be an F32 tensor of shape [64]');
+  }
+
+  const mapped = new Map<string, LazyTensor>();
+  for (const [sourceName, tensor] of sd.tensors) {
+    const targetName = mapGgufTensorName(sourceName);
+    if (!targetName) continue;
+    if (mapped.has(targetName)) {
+      throw checkpointMismatch('LFM3 GGUF', `multiple tensors map to '${targetName}'`);
+    }
+    mapped.set(targetName, tensor);
+  }
+  sd.tensors.clear();
+  for (const [name, tensor] of mapped) sd.tensors.set(name, tensor);
+}
 
 function ropeTables(
   position: number,
@@ -225,11 +335,13 @@ class Lfm3DepthwiseConv extends nn.Module<[Value, number], Value> {
     const name = `${prefix}.weight`;
     const tensor = sd.tensors.get(name);
     if (!tensor) return;
+    const shape = tensor.shape.join();
+    if (shape === [LFM3.hidden, LFM3.convKernel].join()) return;
     const expected = [LFM3.hidden, 1, LFM3.convKernel];
-    if (tensor.shape.join() !== expected.join()) {
+    if (shape !== expected.join()) {
       throw checkpointMismatch(
         'LFM3 depthwise conv',
-        `${name} has shape [${tensor.shape.join(', ')}], expected [${expected.join(', ')}]`,
+        `${name} has shape [${tensor.shape.join(', ')}], expected [${expected.join(', ')}] or [${LFM3.hidden}, ${LFM3.convKernel}]`,
       );
     }
     sd.tensors.set(name, reshapeWeight(tensor, [LFM3.hidden, LFM3.convKernel]));
@@ -428,6 +540,7 @@ export class Lfm3CausalLM extends nn.Module<
   readonly lm_head = new Lfm3LmHead();
 
   override transformStateDict(sd: LazyStateDict): void {
+    if (sd.ggufMetadata) mapGgufStateDict(sd);
     const prefix = 'model.language_model.';
     const original = [...sd.tensors.entries()];
     const language = original.filter(([name]) => name.startsWith(prefix));
@@ -475,6 +588,7 @@ export class Lfm3CausalLM extends nn.Module<
     const result = this.model.forward(embedding, ids.length, position, previous, root, uploads);
     const final = slice(result.hidden, 0, ids.length - 1, ids.length);
     return {
+      hidden: result.hidden,
       logits: this.lm_head.forward(final),
       cache: result.cache,
       uploads,

@@ -6,13 +6,14 @@ import { uploadU32 } from '../../../../src/core/gpu/buffers.ts';
 import { materialized, type Value } from '../../../../src/core/graph/value.ts';
 import { randomF32 } from '../../../gpu.ts';
 
-/** A quantized [E·K, N] weight: the GPU value, its scales and what it
- *  dequantizes to. */
+/** A quantized [E·K, N] weight: the GPU value, its affines and dequantized values. */
 export interface QuantWeight {
   w: Value;
   /** f32 [E·K / groupSize, N]: one scale per group of rows in each column. */
   scales: Float32Array;
-  /** q · scale for row r and column c at [r·N + c], in f64. */
+  /** Optional f32 [E·K / groupSize, N] affine terms. */
+  offsets?: Float32Array;
+  /** q · scale + offset for row r and column c at [r·N + c], in f64. */
   dequant: Float64Array;
 }
 
@@ -51,7 +52,15 @@ export function randomQuantWeight(
     n,
     bits,
     groupSize,
-  }: { experts: number; k: number; n: number; bits: 4 | 8; groupSize: number },
+    offsets: withOffsets = false,
+  }: {
+    experts: number;
+    k: number;
+    n: number;
+    bits: 4 | 8;
+    groupSize: number;
+    offsets?: boolean;
+  },
   seed: number,
 ): QuantWeight {
   const rows = experts * k;
@@ -60,15 +69,19 @@ export function randomQuantWeight(
     Math.min(half - 1, Math.floor(v * half)),
   );
   const scales = randomF32((rows / groupSize) * n, seed + 1).map((v) => (Math.abs(v) + 0.1) / half);
+  const offsetData = withOffsets
+    ? randomF32((rows / groupSize) * n, seed + 2).map((value) => value / 8)
+    : undefined;
   const dequant = new Float64Array(rows * n);
   for (let r = 0; r < rows; r++) {
     for (let c = 0; c < n; c++) {
-      dequant[r * n + c] = q[r * n + c]! * scales[Math.floor(r / groupSize) * n + c]!;
+      const group = Math.floor(r / groupSize) * n + c;
+      dequant[r * n + c] = q[r * n + c]! * scales[group]! + (offsetData?.[group] ?? 0);
     }
   }
   const words = packQuantW(q, experts, k, n, bits);
   const buffer = uploadU32(root, words);
   onTestFinished(() => buffer.destroy());
   const w = materialized({ elems: words.length, dtype: 'quantW', dims: [rows, n] }, buffer);
-  return { w, scales, dequant };
+  return { w, scales, offsets: offsetData, dequant };
 }

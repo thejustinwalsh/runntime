@@ -168,5 +168,7 @@ export type {
   MemoryStateDict,
   QuantTensor,
 } from './weights/safetensors.ts';
+export { fromGguf, parseGgufHeader } from './weights/gguf.ts';
+export type { GgufIndex, GgufTensorInfo, GgufTensorType } from './weights/gguf.ts';
 export { gpuUpload } from './nn/loadStateDict.ts';
 export type { LoadStateDictOpts, UploadFn } from './nn/loadStateDict.ts';

@@ -25,6 +25,7 @@ function makeLayout(elem: Elem) {
     a: { storage: d.arrayOf(elem.vec4), access: 'readonly' },
     w: { storage: d.arrayOf(d.u32), access: 'readonly' },
     scales: { storage: d.arrayOf(d.vec4f), access: 'readonly' }, // [K/group, N/4]
+    offsets: { storage: d.arrayOf(d.vec4f), access: 'readonly' }, // [K/group, N/4]; dead when hasOffset=0
     bias: { storage: d.arrayOf(elem.vec4), access: 'readonly' }, // [N/4]; dead when hasBias=0
     addend: { storage: d.arrayOf(elem.vec4), access: 'readonly' }, // [M,N/4]; dead when hasAdd=0
     out: { storage: d.arrayOf(elem.vec4), access: 'mutable' },
@@ -59,7 +60,7 @@ export function matmulQuantTiledEligible(k: number, n: number, groupSize: number
 }
 
 function makeMatmulQuantTiledKernel(cfg: MatmulQuantCfg, elem: Elem) {
-  const { k, n, bits, groupSize, hasBias, hasAdd } = cfg;
+  const { k, n, bits, groupSize, hasOffset, hasBias, hasAdd } = cfg;
   const layout = layoutFor(elem);
   const storeVec4 = elem.vec4;
   const bk4 = BK / 4;
@@ -120,7 +121,11 @@ function makeMatmulQuantTiledKernel(cfg: MatmulQuantCfg, elem: Elem) {
               bk % 4,
               bits,
             );
-            wv = storeVec4(q * layout.$.scales[std.intdiv(bk, groupSize) * n4 + bc4]!);
+            const group = std.intdiv(bk, groupSize) * n4 + bc4;
+            wv = storeVec4(q * layout.$.scales[group]!);
+            if (hasOffset > 0) {
+              wv = storeVec4(d.vec4f(wv) + d.vec4f(layout.$.offsets[group]!));
+            }
           }
           tileB.$[e] = storeVec4(wv);
         }
@@ -194,6 +199,7 @@ export function matmulQuantTiledHandle(
   // Absent epilogue operands alias `a`; those pipelines never read them.
   const bindGroup = cachedBindGroup(root, layoutFor(elem), {
     ...buffers,
+    offsets: buffers.offsets ?? buffers.scales,
     bias: buffers.bias ?? buffers.a,
     addend: buffers.addend ?? buffers.a,
     dims,

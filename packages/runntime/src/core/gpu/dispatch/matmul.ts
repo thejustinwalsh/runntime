@@ -160,7 +160,8 @@ const QUANT_TILED_MIN_ROWS = 32;
 
 export const matmulQuantWSpec = defineSpec({
   attrs: (p) => {
-    const [baseRow, scaleBase, bits, groupSize, hasBias, hasAdd, act] = p.attrs as [
+    const [baseRow, scaleBase, bits, groupSize, hasOffset, hasBias, hasAdd, act] = p.attrs as [
+      number,
       number,
       number,
       number,
@@ -169,7 +170,7 @@ export const matmulQuantWSpec = defineSpec({
       number,
       number,
     ];
-    return { baseRow, scaleBase, bits, groupSize, hasBias, hasAdd, act };
+    return { baseRow, scaleBase, bits, groupSize, hasOffset, hasBias, hasAdd, act };
   },
   cfg: (node, attrs) => {
     const [m, k] = node.pending!.inputs[0]!.shape.dims as [number, number];
@@ -188,6 +189,7 @@ export const matmulQuantWSpec = defineSpec({
       n,
       bits: attrs.bits,
       groupSize: attrs.groupSize,
+      hasOffset: attrs.hasOffset,
       hasBias: attrs.hasBias,
       hasAdd: attrs.hasAdd,
       act: attrs.act,
@@ -202,12 +204,15 @@ export const matmulQuantWSpec = defineSpec({
     const m = node.pending!.inputs[0]!.shape.dims![0]!;
     const dtype = node.shape.dtype;
     const elem = elemFor(dtype);
-    const addendAt = attrs.hasBias === 1 ? 4 : 3;
+    const offsetAt = 3;
+    const biasAt = attrs.hasOffset === 1 ? 4 : 3;
+    const addendAt = biasAt + (attrs.hasBias === 1 ? 1 : 0);
     const buffers = {
       a: narrowFloat(inputs[0]!, dtype),
       w: narrow(inputs[1]!, 'u32'),
       scales: narrow(inputs[2]!, 'f32'),
-      bias: attrs.hasBias === 1 ? narrowFloat(inputs[3]!, dtype) : undefined,
+      offsets: attrs.hasOffset === 1 ? narrow(inputs[offsetAt]!, 'f32') : undefined,
+      bias: attrs.hasBias === 1 ? narrowFloat(inputs[biasAt]!, dtype) : undefined,
       addend: attrs.hasAdd === 1 ? narrowFloat(inputs[addendAt]!, dtype) : undefined,
       out: narrowFloat(out, dtype),
     };

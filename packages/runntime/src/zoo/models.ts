@@ -18,6 +18,7 @@ import type { EmbedderModel } from './tasks/multimodal/embedding.ts';
 import type { PrivacyFilterModel } from './tasks/nlp/privacyFilter.ts';
 import type { D1DeciderModel } from './tasks/nlp/d1.ts';
 import type { Lfm3ChatModel } from './tasks/nlp/lfm3.ts';
+import { LFM3_Q4_K_M_SOURCE } from './lfm3/gguf.ts';
 
 const HUB = 'https://huggingface.co/software-mansion';
 
@@ -132,12 +133,19 @@ const LFM3_OMNI_2B = {
   modelPath: `https://huggingface.co/LiquidAI/LFM3-Omni-2B/resolve/${LFM3_REVISION}/model.safetensors`,
   tokenizerPath: `https://huggingface.co/LiquidAI/LFM3-Omni-2B/resolve/${LFM3_REVISION}/tokenizer.json`,
 } satisfies Lfm3ChatModel;
+const LFM3_OMNI_2B_Q4_K_M = {
+  format: 'gguf',
+  modelPath: LFM3_Q4_K_M_SOURCE.url,
+  tokenizerPath: LFM3_OMNI_2B.tokenizerPath,
+} satisfies Lfm3ChatModel;
 
 export const models = {
   lfm3: {
-    /** Liquid LFM3-Omni 2B original BF16 text backbone. */
+    /** Liquid LFM3-Omni 2B text backbones. DEFAULT remains the original BF16 weights. */
     LFM3_OMNI_2B: {
       DEFAULT: LFM3_OMNI_2B,
+      /** Published Liquid Q4_K_M GGUF; uses the pinned tokenizer without loading floating weights. */
+      Q4_K_M: LFM3_OMNI_2B_Q4_K_M,
     },
   },
   d1: {

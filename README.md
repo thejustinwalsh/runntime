@@ -131,17 +131,17 @@ call `detectObjects` again. The detector is loaded once.
 Every task has its own factory function and its own methods. Pass it an entry
 from `models`, or spread one and change a field.
 
-| Task                  | Factory                   | Models                                   |
-| --------------------- | ------------------------- | ---------------------------------------- |
-| Chat                  | `createLfm3Chat`          | Liquid LFM3-Omni 2B (original BF16 base) |
-| Embedding             | `createEmbedder`          | EmbeddingGemma 2, all-MiniLM-L6-v2       |
-| Privacy filter        | `createPrivacyFilter`     | OpenAI privacy-filter (int8)             |
-| Speech to text        | `createSpeechToText`      | Moonshine tiny / base, streaming tiny    |
-| Object detection      | `createObjectDetector`    | YOLO26 n / m                             |
-| Instance segmentation | `createInstanceSegmenter` | YOLO26-seg n / m                         |
-| Pose & keypoints      | `createKeypointDetector`  | YOLO26-pose n / m                        |
-| Depth estimation      | `createDepthEstimator`    | DepthART s / b                           |
-| Image classification  | `createImageClassifier`   | MobileNetV4 small                        |
+| Task                  | Factory                   | Models                                |
+| --------------------- | ------------------------- | ------------------------------------- |
+| Chat                  | `createLfm3Chat`          | Liquid LFM3-Omni 2B (BF16 and Q4_K_M) |
+| Embedding             | `createEmbedder`          | EmbeddingGemma 2, all-MiniLM-L6-v2    |
+| Privacy filter        | `createPrivacyFilter`     | OpenAI privacy-filter (int8)          |
+| Speech to text        | `createSpeechToText`      | Moonshine tiny / base, streaming tiny |
+| Object detection      | `createObjectDetector`    | YOLO26 n / m                          |
+| Instance segmentation | `createInstanceSegmenter` | YOLO26-seg n / m                      |
+| Pose & keypoints      | `createKeypointDetector`  | YOLO26-pose n / m                     |
+| Depth estimation      | `createDepthEstimator`    | DepthART s / b                        |
+| Image classification  | `createImageClassifier`   | MobileNetV4 small                     |
 
 ## Coming from transformers.js
 

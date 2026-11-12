@@ -403,8 +403,8 @@ describe('Linear with a quantized weight', () => {
         layer.bias!.value,
         addend,
       ]);
-      // baseRow, scaleBase, bits, groupSize, bias, addend, activation
-      expect(y.pending?.attrs).toEqual([0, 0, 8, 4, 1, 1, ACT_CODE.gelu]);
+      // baseRow, scaleBase, bits, groupSize, offset, bias, addend, activation
+      expect(y.pending?.attrs).toEqual([0, 0, 8, 4, 0, 1, 1, ACT_CODE.gelu]);
     },
   );
 

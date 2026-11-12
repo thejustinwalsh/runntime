@@ -15,6 +15,7 @@ interface Case extends Epilogue {
   n: number;
   bits: 4 | 8;
   groupSize: number;
+  offsets?: boolean;
   dtype?: 'f32' | 'f16';
   experts?: number;
   /** The expert the call reads, through baseRow and scaleBase. */
@@ -26,13 +27,14 @@ async function checkQuantMatmul(c: Case) {
   const { m, k, n, bits, groupSize, dtype = 'f32', experts = 1, expert = 0 } = c;
   const round = dtype === 'f16' ? roundF16 : (v: Float32Array) => v;
   const meta = (rows: number, cols: number) => ({ ...matrix(rows, cols), dtype });
-  const weight = randomQuantWeight(root, { experts, k, n, bits, groupSize }, 2);
+  const weight = randomQuantWeight(root, { experts, k, n, bits, groupSize, offsets: c.offsets }, 2);
   const a = round(randomF32(m * k, 1));
   const bias = c.bias ? round(randomF32(n, 3)) : undefined;
   const addend = c.addend ? round(randomF32(m * n, 4)) : undefined;
   const got = await toArray(
     matmul(upload(root, a, meta(m, k)), weight.w, {
       scales: upload(root, weight.scales, [weight.scales.length / n, n]),
+      offsets: weight.offsets && upload(root, weight.offsets, [weight.offsets.length / n, n]),
       bits,
       groupSize,
       baseRow: expert * k,
@@ -79,6 +81,7 @@ describe('matmulQuantW kernel', () => {
       { name: 'groups of 8, a partial row block', m: 5, k: 64, n: 24, groupSize: 8, dtypes: both },
       { name: 'a partial block of units', m: 8, k: 96, n: 40, groupSize: 32, dtypes: both },
       { name: 'a wide row', m: 2, k: 640, n: 640, groupSize: 32, dtypes: both },
+      { name: 'Q4 affine minima', m: 1, k: 32, n: 32, groupSize: 32, offsets: true, dtypes: f32 },
       { name: 'an LLM decode row', m: 1, k: 2048, n: 2048, groupSize: 64, dtypes: both },
       // matmulQuantW: one below 48·1024 outputs; the tiled suite has the first above
       {
