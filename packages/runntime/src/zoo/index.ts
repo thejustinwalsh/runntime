@@ -43,6 +43,8 @@ export {
   type PrivacyFilterModel,
   type PrivacySpan,
 } from './tasks/nlp/privacyFilter.ts';
+export { createD1Decider, type D1Decider, type D1DeciderModel } from './tasks/nlp/d1.ts';
+export type { Answer, Question, QuestionType } from './d1/prompt.ts';
 
 export {
   createSpeechToText,

@@ -17,7 +17,7 @@ import {
 import { asLoadError, rethrowRunError } from '../errors.ts';
 import { throwIfAborted } from '../load.ts';
 import { preprocessImage, resizeAA, type RgbImage } from './image.ts';
-import { D1, D1Model } from './model.ts';
+import { D1, D1Model, D1TextModel } from './model.ts';
 import {
   encodeQuestion,
   optionCount,
@@ -48,6 +48,12 @@ export interface D1Decider {
   dispose(): Promise<void>;
 }
 
+interface D1DeciderOptions {
+  temperatures?: Record<string, number>;
+  onProgress?: (name: string, done: number, total: number) => void;
+  signal?: AbortSignal;
+}
+
 /** Pair-duplicated RoPE tables [T, headDim] for positions 0..T−1. */
 function ropeTables(t: number): { cos: Float32Array; sin: Float32Array } {
   const hd = D1.headDim;
@@ -67,14 +73,27 @@ function ropeTables(t: number): { cos: Float32Array; sin: Float32Array } {
 export async function createD1Decider(
   sd: LazyStateDict,
   tokenizer: D1Tokenizer,
-  opts: {
-    temperatures?: Record<string, number>;
-    onProgress?: (name: string, done: number, total: number) => void;
-    signal?: AbortSignal;
-  } = {},
+  opts: D1DeciderOptions = {},
+): Promise<D1Decider> {
+  return createD1DeciderWithModel(sd, tokenizer, new D1Model(), opts);
+}
+
+/** Loads the text-only D1 model and ignores audio and vision checkpoint tensors. */
+export async function createD1TextDecider(
+  sd: LazyStateDict,
+  tokenizer: D1Tokenizer,
+  opts: D1DeciderOptions = {},
+): Promise<D1Decider> {
+  return createD1DeciderWithModel(sd, tokenizer, new D1TextModel(), opts);
+}
+
+async function createD1DeciderWithModel(
+  sd: LazyStateDict,
+  tokenizer: D1Tokenizer,
+  model: D1TextModel,
+  opts: D1DeciderOptions,
 ): Promise<D1Decider> {
   const root = defaultRoot();
-  const model = new D1Model();
   const ex = gpuExecutor(root);
   let zeroRow: Value | undefined;
   try {
@@ -90,8 +109,6 @@ export async function createD1Decider(
     zeroRow = tensor(root, new Float32Array(D1.hidden), [1, D1.hidden]);
 
     const temperatures = opts.temperatures ?? {};
-    const posTable = model.vision.position_embedding.data;
-    if (!(posTable instanceof Float32Array)) throw new Error('d1: position table must be f32');
 
     let disposed = false;
     let queue: Promise<void> = Promise.resolve();
@@ -107,6 +124,11 @@ export async function createD1Decider(
 
     /** One image's crops through the tower and projector, rows concatenated. */
     const encodeImage = (img: RgbImage, uploads: Value[]): Value => {
+      if (!(model instanceof D1Model)) {
+        throw new RunntimeError('INVALID_ARGUMENT', 'D1 text decider does not accept images');
+      }
+      const posTable = model.vision.position_embedding.data;
+      if (!(posTable instanceof Float32Array)) throw new Error('d1: position table must be f32');
       const parts = preprocessImage(img).map(({ ph, pw, patches }) => {
         const pos = resizeAA(posTable, D1.posGrid, D1.posGrid, D1.visionHidden, ph, pw);
         const p = tensor(root, patches, [ph * pw, 3 * 16 * 16]);
@@ -169,6 +191,11 @@ export async function createD1Decider(
     const systemOne: D1Decider['systemOne'] = (state, questions, images, options) => {
       if (disposed) {
         return Promise.reject(new RunntimeError('RESOURCE_DISPOSED', 'D1 decider is disposed'));
+      }
+      if (images && images.length > 0 && !(model instanceof D1Model)) {
+        return Promise.reject(
+          new RunntimeError('INVALID_ARGUMENT', 'D1 text decider does not accept images'),
+        );
       }
       const job = queue.then(async () => {
         if (disposed) throw new RunntimeError('RESOURCE_DISPOSED', 'D1 decider is disposed');

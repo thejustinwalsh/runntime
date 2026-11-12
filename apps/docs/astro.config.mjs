@@ -147,6 +147,7 @@ export default defineConfig({
                     { label: 'Embedding', slug: 'zoo/embedding' },
                     { label: 'Speech to text', slug: 'zoo/speech-to-text' },
                     { label: 'Privacy filter', slug: 'zoo/privacy-filter' },
+                    { label: 'D1 decision model', slug: 'zoo/d1' },
                     { label: 'Object detection', slug: 'zoo/object-detection' },
                     { label: 'Instance segmentation', slug: 'zoo/instance-segmentation' },
                     { label: 'Pose & keypoints', slug: 'zoo/pose-and-keypoints' },

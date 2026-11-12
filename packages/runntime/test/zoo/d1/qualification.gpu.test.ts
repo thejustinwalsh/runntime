@@ -18,6 +18,7 @@ import vectors from '../../../playground/d1/reference-vectors.json';
 declare global {
   interface ImportMetaEnv {
     readonly VITE_D1_QUALIFICATION_MODE?: string;
+    readonly VITE_D1_QUALIFICATION_MODEL_URL?: string;
   }
   interface ImportMeta {
     readonly env: ImportMetaEnv;
@@ -26,7 +27,9 @@ declare global {
 
 const MODEL = 'LiquidAI/d1-omni-600M';
 const REVISION = '02b55d7076f15129e59ab3f94783f32c4b088674';
-const MODEL_URL = `https://huggingface.co/${MODEL}/resolve/${REVISION}/model.safetensors`;
+const MODEL_URL =
+  import.meta.env.VITE_D1_QUALIFICATION_MODEL_URL ??
+  `https://huggingface.co/${MODEL}/resolve/${REVISION}/model.safetensors`;
 const MODE = import.meta.env.VITE_D1_QUALIFICATION_MODE;
 const TOLERANCE = 0.001;
 

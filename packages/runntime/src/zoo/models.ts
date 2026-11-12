@@ -16,6 +16,7 @@ import type { ObjectDetectorModel } from './tasks/cv/objectDetection.ts';
 import type { KeypointDetectorModel } from './tasks/cv/keypointDetection.ts';
 import type { EmbedderModel } from './tasks/multimodal/embedding.ts';
 import type { PrivacyFilterModel } from './tasks/nlp/privacyFilter.ts';
+import type { D1DeciderModel } from './tasks/nlp/d1.ts';
 
 const HUB = 'https://huggingface.co/software-mansion';
 
@@ -102,7 +103,40 @@ const YOLO26_POSE_M = {
 const DEPTHART_S = { modelPath: weights('depthart', 's', 'f16') } satisfies DepthEstimatorModel;
 const DEPTHART_B = { modelPath: weights('depthart', 'b', 'f16') } satisfies DepthEstimatorModel;
 
+const D1_REVISION = '02b55d7076f15129e59ab3f94783f32c4b088674';
+const D1_TOKENIZER = `https://huggingface.co/LiquidAI/d1-omni-600M/resolve/${D1_REVISION}/tokenizer.json`;
+const D1_TEMPERATURES = {
+  'choice:11+': 1.372515082359314,
+  'choice:2': 1.7465145587921143,
+  'choice:3-5': 1.3998981714248657,
+  'choice:6-10': 1.1751071214675903,
+  'noul:2': 1.6663223505020142,
+  'score:3-5': 1.7301132678985596,
+  'score:6-10': 1.0,
+  choice: 1.0,
+  score: 1.0,
+  noul: 1.0,
+};
+const D1_Q8 = {
+  tokenizerPath: D1_TOKENIZER,
+  temperatures: D1_TEMPERATURES,
+} satisfies D1DeciderModel;
+const D1_F32 = {
+  ...D1_Q8,
+  modelPath: `https://huggingface.co/LiquidAI/d1-omni-600M/resolve/${D1_REVISION}/model.safetensors`,
+} satisfies D1DeciderModel;
+
 export const models = {
+  d1: {
+    /** Liquid's D1 Omni 600M text decision model. Q8 weights are generated locally. */
+    D1_OMNI_600M: {
+      /** Original float checkpoint. */
+      DEFAULT: D1_F32,
+      F32: D1_F32,
+      /** Supply a locally converted native Q8 checkpoint as modelPath. */
+      Q8: D1_Q8,
+    },
+  },
   embedding: {
     /** Google's EmbeddingGemma 2: text in 100+ languages and code, images
      *  and video in one 768-dim space, inputs up to 2048 tokens. 270M

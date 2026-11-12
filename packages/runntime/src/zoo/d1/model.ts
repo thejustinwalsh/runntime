@@ -265,9 +265,18 @@ export class Vision extends nn.Module<[Value, Value, number, number], Value> {
   }
 }
 
-export class D1Model extends nn.Module {
+/** Text-only D1 model used by the public decision runner. */
+export class D1TextModel extends nn.Module {
   readonly encoder = new Trunk();
   readonly head = new DecisionHead();
+
+  override transformStateDict(sd: LazyStateDict): void {
+    transformD1StateDict(sd, false);
+  }
+}
+
+/** Full D1 model, including the optional image tower used by the playground. */
+export class D1Model extends D1TextModel {
   readonly vision = new Vision();
 
   override transformStateDict(sd: LazyStateDict): void {
