@@ -2,7 +2,10 @@
 
 import { expect, it } from 'vitest';
 import { RunntimeError, type GgufIndex, type GgufTensorInfo } from '../../../../src/core/index.ts';
-import { validateLfm3AudioProjector } from '../../../../src/zoo/lfm3/audio/projector.ts';
+import {
+  LFM3_AUDIO_PROJECTOR_TENSOR_LAYOUT,
+  validateLfm3AudioProjector,
+} from '../../../../src/zoo/lfm3/audio/projector.ts';
 
 const metadata = {
   'general.architecture': 'clip',
@@ -20,6 +23,7 @@ const metadata = {
   'clip.audio.num_mel_bins': 128,
   'clip.audio.window_size': 32,
   'clip.has_gen_audio_encoder': true,
+  'clip.use_silu': true,
   'clip.gen.audio.projector_type': 'lfm3a_gen',
   'clip.gen.audio.projection_dim': 2_048,
   'clip.gen.audio.embedding_length': 1_024,
@@ -48,15 +52,10 @@ function projectorIndex(
   } = {},
 ): GgufIndex {
   const tensors = new Map(
-    [
-      tensor('a.pre_encode.out.weight', [768, 4_096], 'Q8_0'),
-      tensor('a.blk.16.attn_q.weight', [768, 768], 'Q8_0'),
-      tensor('a.gen.code.embd.weight', [12, 2_017, 1_024], 'Q8_0'),
-      tensor('a.gen.code.blk.2.attn_q.weight', [1_024, 1_024], 'Q8_0'),
-      tensor('a.gen.wav.quant.first.codebook.weight', [2_016, 4], 'F32'),
-      tensor('a.gen.wav.tfm.blk.7.conv_dw.weight', [512, 7], 'F32'),
-      tensor('a.gen.wav.tfm.out_proj.weight', [1_282, 512], 'Q8_0'),
-    ].map((entry) => [entry.name, entry]),
+    LFM3_AUDIO_PROJECTOR_TENSOR_LAYOUT.map((entry) => [
+      entry.name,
+      tensor(entry.name, [...entry.shape], entry.type),
+    ]),
   );
   for (const [name, value] of overrides.tensors ?? []) tensors.set(name, value);
   return {
@@ -69,6 +68,7 @@ function projectorIndex(
 }
 
 it('returns the pinned encoder, depth-decoder and codec dimensions', () => {
+  expect(LFM3_AUDIO_PROJECTOR_TENSOR_LAYOUT).toHaveLength(319);
   expect(validateLfm3AudioProjector(projectorIndex())).toEqual({
     encoder: {
       sampleRate: 16_000,
@@ -125,4 +125,26 @@ it('rejects a missing or wrong-format codec tensor', () => {
       }),
     ),
   ).toThrow(/expected Q8_0/);
+});
+
+it('rejects a missing encoder tensor and an unexpected audio tensor', () => {
+  const missing = projectorIndex();
+  missing.tensors.delete('a.blk.16.attn_k_norm.weight');
+  expect(() => validateLfm3AudioProjector(missing)).toThrow(
+    /missing a\.blk\.16\.attn_k_norm\.weight/,
+  );
+
+  const unexpected = projectorIndex();
+  const extra = tensor('a.unexpected.weight', [1], 'F32');
+  unexpected.tensors.set(extra.name, extra);
+  expect(() => validateLfm3AudioProjector(unexpected)).toThrow(/unexpected audio tensor/);
+});
+
+it('rejects unsupported GGUF versions and unexpected audio metadata', () => {
+  expect(() => validateLfm3AudioProjector({ ...projectorIndex(), version: 2 })).toThrow(
+    /expected GGUF version 3/,
+  );
+  expect(() =>
+    validateLfm3AudioProjector(projectorIndex({ metadata: { 'clip.use_silu': false } })),
+  ).toThrow(/clip\.use_silu=true/);
 });
