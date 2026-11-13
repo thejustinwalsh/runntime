@@ -52,7 +52,7 @@ function directLogMel(audio: Float32Array): Float32Array {
       );
       energy += powers[bin]! * triangle * (2 / (upper - lower));
     }
-    return (Math.log10(Math.max(energy, 1e-12)) + 4) / 8;
+    return (Math.log10(Math.max(energy, 1e-12)) + 4) / 4;
   });
 }
 
@@ -83,7 +83,7 @@ describe('LFM3-Omni audio frontend', () => {
     expect(mel).toHaveLength(LFM3_AUDIO_MEL_BINS * frames);
     expect(mel.every(Number.isFinite)).toBe(true);
     expect(mel).toEqual(
-      Float32Array.from({ length: mel.length }, () => (Math.log10(1e-12) + 4) / 8),
+      Float32Array.from({ length: mel.length }, () => (Math.log10(1e-12) + 4) / 4),
     );
   });
 
