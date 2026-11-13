@@ -35,8 +35,36 @@ interface LiquidLanguageModel {
   }): AsyncIterable<number>;
 }
 
+interface LiquidAudioStreamOptions {
+  readonly input_ids: readonly number[][];
+  readonly audio?: readonly Float32Array[];
+  readonly generation_mode?: 'audio';
+  readonly max_new_tokens: number;
+  readonly do_sample: boolean;
+  readonly seed?: number;
+  readonly depth_decoder_do_sample?: boolean;
+  readonly depth_decoder_temperature?: number;
+  readonly on_speech?: LiquidSpeechCallback;
+}
+
+interface LiquidSpeechCallback {
+  (audio: Float32Array): void;
+  frame?(codes: Int32Array): void;
+}
+
+interface LiquidAudioModel {
+  readonly tokens: { readonly audio: number };
+  planAudio(samples: Float32Array): { readonly tokens: number; readonly tokenId: number };
+  streamTokenIds(options: LiquidAudioStreamOptions): AsyncIterable<number>;
+}
+
 interface LiquidReferenceModel {
-  readonly model: { readonly language_model: LiquidLanguageModel };
+  readonly model: {
+    readonly language_model: LiquidLanguageModel;
+    readonly tokens: { readonly audio: number };
+    planAudio: LiquidAudioModel['planAudio'];
+    streamTokenIds: LiquidAudioModel['streamTokenIds'];
+  };
   readonly tokenizer: {
     encode(text: string, options?: { add_special_tokens?: boolean }): { ids: number[] };
     decode(
@@ -49,6 +77,7 @@ interface LiquidReferenceModel {
 
 interface LiquidModel {
   readonly reference: LiquidReferenceModel;
+  readonly audio_sampling_rate: number;
   dispose(): Promise<void>;
 }
 
@@ -63,6 +92,10 @@ declare global {
     readonly VITE_LFM3_QUALIFICATION_MODE?: string;
     readonly VITE_LFM3_LIQUID_ENGINE_URL?: string;
     readonly VITE_LFM3_LIQUID_REFERENCE_CAPTURE?: string;
+    readonly VITE_LFM3_LIQUID_MODEL_URL?: string;
+    readonly VITE_LFM3_LIQUID_PROJECTOR_URL?: string;
+    readonly VITE_LFM3_LIQUID_AUDIO_INPUT_BASE_URL?: string;
+    readonly VITE_LFM3_LIQUID_AUDIO_CAPTURE?: string;
   }
   interface ImportMeta {
     readonly env: ImportMetaEnv;
@@ -71,11 +104,19 @@ declare global {
 
 const MODE = import.meta.env.VITE_LFM3_QUALIFICATION_MODE;
 const ENGINE_URL = import.meta.env.VITE_LFM3_LIQUID_ENGINE_URL;
+const LIQUID_MODEL_URL = import.meta.env.VITE_LFM3_LIQUID_MODEL_URL;
+const LIQUID_PROJECTOR_URL = import.meta.env.VITE_LFM3_LIQUID_PROJECTOR_URL;
+const AUDIO_INPUT_BASE_URL = import.meta.env.VITE_LFM3_LIQUID_AUDIO_INPUT_BASE_URL;
+const AUDIO_CAPTURE = import.meta.env.VITE_LFM3_LIQUID_AUDIO_CAPTURE === '1';
 const ENGINE_REVISION = '9c2fb176f4c222da394e8037d3c0d0837f70b978';
 const ENGINE_SHA256 = '77821949412f5dd6d60e37f22415f0e71454e65f6a73928529c6fbec0f2cf2cb';
 const GGUF_REVISION = '3d29af2ad166f8299c2d820937e47dc0add20ffc';
-const GGUF_URL = `https://huggingface.co/LiquidAI/LFM3-Omni-2B-GGUF/resolve/${GGUF_REVISION}/LFM3-Omni-2B-Q4_K_M.gguf`;
-const PROJECTOR_URL = `https://huggingface.co/LiquidAI/LFM3-Omni-2B-GGUF/resolve/${GGUF_REVISION}/mmproj-LFM3-Omni-2B-Q8_0.gguf`;
+const GGUF_URL =
+  LIQUID_MODEL_URL ??
+  `https://huggingface.co/LiquidAI/LFM3-Omni-2B-GGUF/resolve/${GGUF_REVISION}/LFM3-Omni-2B-Q4_K_M.gguf`;
+const PROJECTOR_URL =
+  LIQUID_PROJECTOR_URL ??
+  `https://huggingface.co/LiquidAI/LFM3-Omni-2B-GGUF/resolve/${GGUF_REVISION}/mmproj-LFM3-Omni-2B-Q8_0.gguf`;
 const CASES = [
   {
     id: 'arithmetic',
@@ -112,6 +153,318 @@ function isLiquidEngineModule(value: unknown): value is LiquidEngineModule {
     constructor !== null &&
     typeof Reflect.get(constructor, 'from_pretrained') === 'function'
   );
+}
+
+interface AudioReferenceCase {
+  readonly id: string;
+  readonly file: string;
+  readonly transcript: string;
+}
+
+interface AudioReferenceResult {
+  readonly id: string;
+  readonly input: {
+    readonly file: string;
+    readonly transcript: string;
+    readonly sampleRate: number;
+    readonly samples: number;
+    readonly bytes: number;
+    readonly sha256: string;
+  };
+  readonly liquidTranscription: {
+    readonly text: string;
+    readonly normalizedText: string;
+    readonly promptTokens: number;
+    readonly generatedTokens: number;
+    readonly matchesExpected: boolean;
+  };
+  readonly liquidSpeech: {
+    readonly file: string;
+    readonly sampleRate: number;
+    readonly samples: number;
+    readonly seconds: number;
+    readonly bytes: number;
+    readonly sha256: string;
+    readonly seed: number;
+    readonly depthDecoderTemperature: number;
+    readonly speechFrames: number;
+    readonly streamChunks: number;
+    readonly generatedTokens: number;
+    readonly finiteNonempty: boolean;
+  };
+  readonly speechTranscription: {
+    readonly text: string;
+    readonly normalizedText: string;
+    readonly promptTokens: number;
+    readonly generatedTokens: number;
+    readonly recoversRequestedText: boolean;
+  };
+}
+
+const AUDIO_CASES: readonly AudioReferenceCase[] = [
+  {
+    id: 'quick-brown-fox',
+    file: 'quick-brown-fox.wav',
+    transcript: 'The quick brown fox jumps over the lazy dog.',
+  },
+  {
+    id: 'turn-left-next-street',
+    file: 'turn-left-next-street.wav',
+    transcript: 'Please turn left at the next street.',
+  },
+];
+
+function decodePcm16Wav(data: ArrayBuffer): { samples: Float32Array; sampleRate: number } {
+  const bytes = new Uint8Array(data);
+  const view = new DataView(data);
+  if (bytes.length < 44 || new TextDecoder().decode(bytes.subarray(0, 4)) !== 'RIFF') {
+    throw new Error('audio fixture is not a RIFF WAV');
+  }
+  let sampleRate = 0;
+  let channels = 0;
+  let format = 0;
+  let bits = 0;
+  let dataOffset = -1;
+  let dataBytes = 0;
+  for (let offset = 12; offset + 8 <= bytes.length;) {
+    const chunk = new TextDecoder().decode(bytes.subarray(offset, offset + 4));
+    const size = view.getUint32(offset + 4, true);
+    const body = offset + 8;
+    if (body + size > bytes.length) throw new Error(`truncated WAV ${chunk} chunk`);
+    if (chunk === 'fmt ') {
+      format = view.getUint16(body, true);
+      channels = view.getUint16(body + 2, true);
+      sampleRate = view.getUint32(body + 4, true);
+      bits = view.getUint16(body + 14, true);
+    } else if (chunk === 'data') {
+      dataOffset = body;
+      dataBytes = size;
+    }
+    offset = body + size + (size % 2);
+  }
+  if (format !== 1 || channels !== 1 || bits !== 16 || sampleRate !== 16_000) {
+    throw new Error(
+      `WAV must be mono PCM16 at 16 kHz; got format=${format}, channels=${channels}, bits=${bits}, rate=${sampleRate}`,
+    );
+  }
+  if (dataOffset < 0 || dataBytes === 0 || dataBytes % 2 !== 0) {
+    throw new Error('WAV has no whole PCM16 samples');
+  }
+  const samples = new Float32Array(dataBytes / 2);
+  for (let index = 0; index < samples.length; index++) {
+    samples[index] = view.getInt16(dataOffset + index * 2, true) / 32_768;
+  }
+  return { samples, sampleRate };
+}
+
+function normalizeWords(text: string): string {
+  return text
+    .toLocaleLowerCase('en-US')
+    .replace(/[^\p{L}\p{N}]+/gu, ' ')
+    .trim()
+    .replace(/\s+/g, ' ');
+}
+
+async function sha256(data: ArrayBuffer): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', data);
+  return Array.from(new Uint8Array(digest), (value) => value.toString(16).padStart(2, '0')).join(
+    '',
+  );
+}
+
+function encodeFloat32Wav(samples: Float32Array, sampleRate: number): ArrayBuffer {
+  const buffer = new ArrayBuffer(44 + samples.length * 4);
+  const view = new DataView(buffer);
+  const writeTag = (offset: number, value: string): void => {
+    for (let index = 0; index < value.length; index++)
+      view.setUint8(offset + index, value.charCodeAt(index));
+  };
+  writeTag(0, 'RIFF');
+  view.setUint32(4, buffer.byteLength - 8, true);
+  writeTag(8, 'WAVE');
+  writeTag(12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 3, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 4, true);
+  view.setUint16(32, 4, true);
+  view.setUint16(34, 32, true);
+  writeTag(36, 'data');
+  view.setUint32(40, samples.length * 4, true);
+  for (let index = 0; index < samples.length; index++) {
+    view.setFloat32(44 + index * 4, samples[index]!, true);
+  }
+  return buffer;
+}
+
+function audioPromptIds(reference: LiquidReferenceModel, placeholderCount: number): number[] {
+  const placeholders = '<|audio|>'.repeat(placeholderCount);
+  const prompt = `<|startoftext|><|im_start|>user\nTranscribe this audio: ${placeholders}<|im_end|>\n<|im_start|>assistant\n<think></think>`;
+  const ids = reference.tokenizer.encode(prompt, { add_special_tokens: false }).ids;
+  const audioId = reference.model.tokens.audio;
+  const audioPositions = ids.flatMap((id, index) => (id === audioId ? [index] : []));
+  if (audioPositions.length !== placeholderCount) {
+    throw new Error(
+      `Liquid tokenizer produced ${audioPositions.length} audio placeholders, expected ${placeholderCount}`,
+    );
+  }
+  return ids;
+}
+
+async function streamLiquidTokens(
+  model: LiquidAudioModel,
+  reference: LiquidReferenceModel,
+  input: {
+    readonly samples?: Float32Array;
+    readonly prompt: string;
+    readonly maxNewTokens: number;
+    readonly seed?: number;
+    readonly onSpeech?: LiquidSpeechCallback;
+  },
+): Promise<{ tokenIds: number[]; inputTokens: number }> {
+  const audio = input.samples;
+  let ids: number[];
+  let audioInputs: readonly Float32Array[] | undefined;
+  if (audio) {
+    const plan = reference.model.planAudio(audio);
+    ids = audioPromptIds(reference, plan.tokens);
+    if (plan.tokenId !== reference.model.tokens.audio) {
+      throw new Error('Liquid audio token ID does not match planAudio');
+    }
+    audioInputs = [audio];
+  } else {
+    ids = reference.encodePrompt([{ role: 'user', content: input.prompt }]);
+  }
+  const tokenIds: number[] = [];
+  for await (const token of model.streamTokenIds({
+    input_ids: [ids],
+    ...(audioInputs ? { audio: audioInputs } : {}),
+    ...(input.onSpeech ? { generation_mode: 'audio' as const, on_speech: input.onSpeech } : {}),
+    max_new_tokens: input.maxNewTokens,
+    do_sample: false,
+    ...(input.seed === undefined
+      ? {}
+      : { seed: input.seed, depth_decoder_do_sample: true, depth_decoder_temperature: 0.4 }),
+  })) {
+    tokenIds.push(token);
+  }
+  return { tokenIds, inputTokens: ids.length };
+}
+
+async function captureAudioReferences(
+  reference: LiquidReferenceModel,
+  speechSampleRate: number,
+): Promise<AudioReferenceResult[]> {
+  if (!AUDIO_INPUT_BASE_URL) throw new Error('the local frozen audio fixture URL was not provided');
+  const audioModel: LiquidAudioModel = reference.model;
+  const results: AudioReferenceResult[] = [];
+  for (const testCase of AUDIO_CASES) {
+    const response = await fetch(`${AUDIO_INPUT_BASE_URL.replace(/\/$/, '')}/${testCase.file}`);
+    if (!response.ok) throw new Error(`failed to load ${testCase.file}: HTTP ${response.status}`);
+    const inputBytes = await response.arrayBuffer();
+    const inputDigest = await sha256(inputBytes);
+    const { samples, sampleRate } = decodePcm16Wav(inputBytes);
+    const transcription = await streamLiquidTokens(audioModel, reference, {
+      samples,
+      prompt: '',
+      maxNewTokens: 128,
+    });
+    const transcript = reference.tokenizer
+      .decode(transcription.tokenIds, {
+        skip_special_tokens: true,
+        clean_up_tokenization_spaces: false,
+      })
+      .trim();
+    const audioChunks: Float32Array[] = [];
+    let speechFrames = 0;
+    const onSpeech: LiquidSpeechCallback = Object.assign(
+      (chunk: Float32Array) => audioChunks.push(chunk),
+      { frame: () => speechFrames++ },
+    );
+    const speech = await streamLiquidTokens(audioModel, reference, {
+      prompt: `Say exactly: ${testCase.transcript}`,
+      maxNewTokens: 256,
+      seed: 1234,
+      onSpeech,
+    });
+    const totalSamples = audioChunks.reduce((sum, chunk) => sum + chunk.length, 0);
+    const speechSamples = new Float32Array(totalSamples);
+    let cursor = 0;
+    for (const chunk of audioChunks) {
+      speechSamples.set(chunk, cursor);
+      cursor += chunk.length;
+    }
+    if (speechSampleRate !== 24_000) {
+      throw new Error(`Liquid speech sample rate is ${speechSampleRate}, expected 24000`);
+    }
+    if (speechSamples.length === 0 || !speechSamples.every(Number.isFinite)) {
+      throw new Error(`Liquid speech for ${testCase.id} is empty or non-finite`);
+    }
+    const speechBytes = encodeFloat32Wav(speechSamples, speechSampleRate);
+    const speechDigest = await sha256(speechBytes);
+    const speechFilename = `liquid-speech-${testCase.id}.wav`;
+    const saved = await fetch(`/__liquid-audio-output/${speechFilename}`, {
+      method: 'POST',
+      headers: { 'content-type': 'audio/wav' },
+      body: speechBytes,
+    });
+    if (saved.status !== 204)
+      throw new Error(`failed to save Liquid speech fixture: HTTP ${saved.status}`);
+
+    const speechTranscription = await streamLiquidTokens(audioModel, reference, {
+      samples: speechSamples,
+      prompt: '',
+      maxNewTokens: 128,
+    });
+    const speechTranscript = reference.tokenizer
+      .decode(speechTranscription.tokenIds, {
+        skip_special_tokens: true,
+        clean_up_tokenization_spaces: false,
+      })
+      .trim();
+    results.push({
+      id: testCase.id,
+      input: {
+        file: testCase.file,
+        transcript: testCase.transcript,
+        sampleRate,
+        samples: samples.length,
+        bytes: inputBytes.byteLength,
+        sha256: inputDigest,
+      },
+      liquidTranscription: {
+        text: transcript,
+        normalizedText: normalizeWords(transcript),
+        promptTokens: transcription.inputTokens,
+        generatedTokens: transcription.tokenIds.length,
+        matchesExpected: normalizeWords(transcript) === normalizeWords(testCase.transcript),
+      },
+      liquidSpeech: {
+        file: speechFilename,
+        sampleRate: speechSampleRate,
+        samples: speechSamples.length,
+        seconds: speechSamples.length / speechSampleRate,
+        bytes: speechBytes.byteLength,
+        sha256: speechDigest,
+        seed: 1234,
+        depthDecoderTemperature: 0.4,
+        speechFrames,
+        streamChunks: audioChunks.length,
+        generatedTokens: speech.tokenIds.length,
+        finiteNonempty: true,
+      },
+      speechTranscription: {
+        text: speechTranscript,
+        normalizedText: normalizeWords(speechTranscript),
+        promptTokens: speechTranscription.inputTokens,
+        generatedTokens: speechTranscription.tokenIds.length,
+        recoversRequestedText:
+          normalizeWords(speechTranscript) === normalizeWords(testCase.transcript),
+      },
+    });
+  }
+  return results;
 }
 
 async function teacherForcedVectors(
@@ -195,6 +548,9 @@ it.skipIf(MODE !== 'liquid-reference')(
         ...teacherForced,
       });
     }
+    const audioFixtures = AUDIO_CAPTURE
+      ? await captureAudioReferences(reference, model.audio_sampling_rate)
+      : undefined;
     const report = {
       schemaVersion: 1,
       engine: { revision: ENGINE_REVISION, sha256: ENGINE_SHA256 },
@@ -210,6 +566,7 @@ it.skipIf(MODE !== 'liquid-reference')(
         sha256: '8a25f9d1931244429de404fccacfb7fb933970a36aa5688d2f5069f29c6b27b1',
       },
       fixtures,
+      ...(audioFixtures ? { audioFixtures } : {}),
     };
     const encoded = JSON.stringify(report);
     if (import.meta.env.VITE_LFM3_LIQUID_REFERENCE_CAPTURE === '1') {
@@ -219,6 +576,18 @@ it.skipIf(MODE !== 'liquid-reference')(
         body: encoded,
       });
       expect(response.status).toBe(204);
+    }
+    if (audioFixtures) {
+      console.info(`LFM3_LIQUID_AUDIO_REFERENCE ${JSON.stringify(audioFixtures)}`);
+      expect(audioFixtures).toHaveLength(AUDIO_CASES.length);
+      for (const fixture of audioFixtures) {
+        expect(fixture.input.sampleRate).toBe(16_000);
+        expect(fixture.liquidTranscription.matchesExpected).toBe(true);
+        expect(fixture.liquidSpeech.sampleRate).toBe(24_000);
+        expect(fixture.liquidSpeech.finiteNonempty).toBe(true);
+        expect(fixture.liquidSpeech.speechFrames).toBeGreaterThan(0);
+        expect(fixture.speechTranscription.recoversRequestedText).toBe(true);
+      }
     }
     expect(fixtures).toHaveLength(CASES.length);
   },

@@ -29,6 +29,10 @@ const reportPath = process.env.LFM3_BASE_VITEST_REPORT;
 const qualificationMode = process.env.LFM3_BASE_QUALIFICATION_MODE ?? 'base';
 const liquidEnginePath = process.env.LFM3_LIQUID_ENGINE_PATH;
 const liquidReferenceOutput = process.env.LFM3_LIQUID_REFERENCE_OUTPUT;
+const liquidModelUrl = process.env.LFM3_LIQUID_MODEL_URL ?? modelUrl;
+const liquidProjectorUrl = process.env.LFM3_LIQUID_PROJECTOR_URL;
+const liquidAudioInputBaseUrl = process.env.LFM3_LIQUID_AUDIO_INPUT_BASE_URL;
+const liquidAudioOutputDirectory = process.env.LFM3_LIQUID_AUDIO_OUTPUT_DIR;
 const packedTestFile = process.env.LFM3_PACKED_TEST_FILE;
 const keepTemporaryDirectory = process.env.LFM3_KEEP_PACKED_TEMP === '1';
 
@@ -182,7 +186,8 @@ export function gpu() {
     `import { playwright } from '@vitest/browser-playwright';
 import typegpu from 'unplugin-typegpu/vite';
 import { defineConfig } from 'vitest/config';
-import { writeFileSync } from 'node:fs';
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { basename, dirname, join } from 'node:path';
 
 export default defineConfig({
   plugins: [typegpu(), {
@@ -194,6 +199,20 @@ export default defineConfig({
         request.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
         request.on('end', () => {
           writeFileSync(${JSON.stringify(join(temporaryDirectory, 'liquid-reference-fixture.json'))}, Buffer.concat(chunks));
+          response.statusCode = 204;
+          response.end();
+        });
+      });
+      server.middlewares.use('/__liquid-audio-output', (request, response) => {
+        if (request.method !== 'POST') { response.statusCode = 405; response.end(); return; }
+        const filename = basename(new URL(request.url ?? '/', 'http://localhost').pathname);
+        if (!/^liquid-speech-[a-z0-9-]+\\.wav$/.test(filename)) { response.statusCode = 400; response.end(); return; }
+        const chunks = [];
+        request.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
+        request.on('end', () => {
+          const output = join(${JSON.stringify(join(temporaryDirectory, 'liquid-audio'))}, filename);
+          mkdirSync(dirname(output), { recursive: true });
+          writeFileSync(output, Buffer.concat(chunks));
           response.statusCode = 204;
           response.end();
         });
@@ -227,7 +246,15 @@ export default defineConfig({
             'https://huggingface.co/LiquidAI/LFM3-Omni-2B/resolve/21d75123f86c1f7ffb4bef1ea202710c4e7ebe67/tokenizer.json',
         }),
     ...(qualificationMode === 'liquid-reference'
-      ? { VITE_LFM3_LIQUID_ENGINE_URL: '/test/zoo/lfm3/liquid-reference-engine.js' }
+      ? {
+          VITE_LFM3_LIQUID_ENGINE_URL: '/test/zoo/lfm3/liquid-reference-engine.js',
+          ...(liquidModelUrl ? { VITE_LFM3_LIQUID_MODEL_URL: liquidModelUrl } : {}),
+          ...(liquidProjectorUrl ? { VITE_LFM3_LIQUID_PROJECTOR_URL: liquidProjectorUrl } : {}),
+          ...(liquidAudioInputBaseUrl
+            ? { VITE_LFM3_LIQUID_AUDIO_INPUT_BASE_URL: liquidAudioInputBaseUrl }
+            : {}),
+          ...(liquidAudioOutputDirectory ? { VITE_LFM3_LIQUID_AUDIO_CAPTURE: '1' } : {}),
+        }
       : {}),
     ...(liquidReferenceOutput ? { VITE_LFM3_LIQUID_REFERENCE_CAPTURE: '1' } : {}),
   };
@@ -250,6 +277,16 @@ export default defineConfig({
     const capturedFixture = join(temporaryDirectory, 'liquid-reference-fixture.json');
     if (!existsSync(capturedFixture)) throw new Error('Liquid reference fixture was not captured');
     copyFileSync(capturedFixture, resolve(liquidReferenceOutput));
+  }
+  if (liquidAudioOutputDirectory) {
+    const capturedAudio = join(temporaryDirectory, 'liquid-audio');
+    if (!existsSync(capturedAudio)) throw new Error('Liquid speech audio was not captured');
+    mkdirSync(resolve(liquidAudioOutputDirectory), { recursive: true });
+    const files = readdirSync(capturedAudio).filter((name) => name.endsWith('.wav'));
+    if (files.length === 0) throw new Error('Liquid speech audio capture is empty');
+    for (const name of files) {
+      copyFileSync(join(capturedAudio, name), join(resolve(liquidAudioOutputDirectory), name));
+    }
   }
 } finally {
   if (keepTemporaryDirectory) console.info(`LFM3_PACKED_TEMP ${temporaryDirectory}`);
