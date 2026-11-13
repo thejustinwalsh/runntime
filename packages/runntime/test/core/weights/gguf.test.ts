@@ -6,7 +6,7 @@ import { Sha256 } from '../../../src/core/weights/sha256.ts';
 interface TensorFixture {
   name: string;
   dimensions: number[];
-  type: 0 | 12 | 14;
+  type: 0 | 1 | 8 | 12 | 14;
   payload: Uint8Array;
 }
 
@@ -146,6 +146,22 @@ describe('GGUF v3 weights', () => {
     });
   });
 
+  it('decodes GGUF F16 tensors to f32 values', async () => {
+    const payload = new Uint8Array(4);
+    half(payload, 0, 0x3c00);
+    half(payload, 2, 0xc000);
+    const bytes = fixture([{ name: 'f16', dimensions: [2], type: 1, payload }]);
+    const index = await parseGgufHeader(source(bytes), bytes.byteLength);
+    expect(index.tensors.get('f16')).toMatchObject({ shape: [2], type: 'F16' });
+    const state = await fromGguf(source(bytes), {
+      fileBytes: bytes.byteLength,
+      sha256: sha256(bytes),
+    });
+    const tensor = state.tensors.get('f16');
+    if (!tensor || tensor.kind !== 'derived') throw new Error('expected derived F16 tensor');
+    expect(await tensor.f32()).toEqual(new Float32Array([1, -2]));
+  });
+
   it('decodes all Q4_K groups and preserves their affine minima', async () => {
     const block = q4Block();
     const bytes = fixture([{ name: 'q4', dimensions: [256], type: 12, payload: block.payload }]);
@@ -184,6 +200,78 @@ describe('GGUF v3 weights', () => {
     expect(await tensor.scales()).toEqual(new Float32Array(block.scales));
     expect(tensor.offsets).toBeUndefined();
   });
+
+  it('unpacks Q8_0 codes and one F16 scale per 32-value block', async () => {
+    const payload = new Uint8Array(34);
+    half(payload, 0, 0x3800); // d = 0.5
+    const expected = Array.from({ length: 32 }, (_, index) => index - 16);
+    payload.set(
+      expected.map((value) => value & 0xff),
+      2,
+    );
+    const bytes = fixture([{ name: 'q8_0', dimensions: [32], type: 8, payload }]);
+    const state = await fromGguf(source(bytes), {
+      fileBytes: bytes.byteLength,
+      sha256: sha256(bytes),
+    });
+    const tensor = state.tensors.get('q8_0');
+    if (tensor?.kind !== 'quant') throw new Error('expected Q8_0 quantized tensor');
+    expect(tensor.bits).toBe(8);
+    expect(tensor.groupSize).toBe(32);
+    expect(await tensor.ints()).toEqual(new Int8Array(expected));
+    expect(await tensor.scales()).toEqual(new Float32Array([0.5]));
+    expect(tensor.offsets).toBeUndefined();
+  });
+
+  it.each([
+    { name: 'Q4_K', type: 12 as const, dimensions: [256 * 59_000], bytesPerBlock: 144 },
+    { name: 'Q6_K', type: 14 as const, dimensions: [256 * 40_000], bytesPerBlock: 210 },
+    { name: 'Q8_0', type: 8 as const, dimensions: [32 * 247_000], bytesPerBlock: 34 },
+  ])(
+    'reads each $name tensor range once for codes and scales',
+    async ({ name, type, dimensions, bytesPerBlock }) => {
+      const blocks = dimensions[0]! / (type === 8 ? 32 : 256);
+      const bytes = fixture([
+        {
+          name,
+          dimensions,
+          type,
+          payload: new Uint8Array(blocks * bytesPerBlock),
+        },
+      ]);
+      const reads: { begin: number; end: number }[] = [];
+      const countedSource: RangeSource = {
+        async read(begin, end) {
+          reads.push({ begin, end });
+          return bytes.slice(begin, end);
+        },
+      };
+      const state = await fromGguf(countedSource, {
+        fileBytes: bytes.byteLength,
+        sha256: sha256(bytes),
+      });
+      const tensor = state.tensors.get(name);
+      if (tensor?.kind !== 'quant') throw new Error(`expected ${name} quantized tensor`);
+      await tensor.ints();
+      await tensor.scales();
+      if (tensor.offsets) await tensor.offsets();
+
+      const chunkBytes = 2 * 1024 * 1024;
+      const payloadChunks = reads.filter(
+        ({ begin, end }) =>
+          begin % chunkBytes === 0 &&
+          (end - begin === chunkBytes || (begin > 0 && end - begin < chunkBytes)),
+      );
+      const chunkCount = Math.ceil(bytes.byteLength / chunkBytes);
+      const readsPerChunk = new Map<number, number>();
+      for (const { begin } of payloadChunks) {
+        readsPerChunk.set(begin, (readsPerChunk.get(begin) ?? 0) + 1);
+      }
+      expect([...readsPerChunk]).toEqual(
+        Array.from({ length: chunkCount }, (_, index) => [index * chunkBytes, 2]),
+      );
+    },
+  );
 
   it('rejects a mismatched source digest before exposing tensors', async () => {
     const bytes = fixture([

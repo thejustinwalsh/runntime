@@ -1,6 +1,10 @@
 /** Opt-in real-WebGPU loading and streaming through the public zoo entry. */
 
 import { expect, it } from 'vitest';
+import { tensor } from '../../../src/core/gpu/buffers.ts';
+import { evalValues, toArray } from '../../../src/core/gpu/eval.ts';
+import { add } from '../../../src/core/graph/ops.ts';
+import { matrix } from '../../../src/core/graph/value.ts';
 import {
   createLfm3Chat,
   models,
@@ -60,7 +64,7 @@ function hostHeapBytes(): number | null {
 it.skipIf(MODE !== 'base' && MODE !== 'q4')(
   `loads the ${MODE === 'q4' ? 'published Q4_K_M GGUF' : 'original checkpoint'} and streams text through a packed public consumer`,
   async (ctx) => {
-    await gpu();
+    const { root, ex: sharedExecutor } = await gpu();
     const before = liveBuffers();
     const invalidSource: RangeSource = { read: async () => new Uint8Array(8) };
     const loadController = new AbortController();
@@ -172,6 +176,15 @@ it.skipIf(MODE !== 'base' && MODE !== 'q4')(
     const recovered = await request('Say hello again briefly.');
     expect(recovered.text.trim().length).toBeGreaterThan(0);
     await session.dispose();
+
+    const sharedInput = tensor(root, Float32Array.of(2, 4), matrix(1, 2));
+    const sharedOutput = add(sharedInput, 1);
+    evalValues([sharedOutput], sharedExecutor);
+    expect(await toArray(sharedOutput, sharedExecutor)).toEqual(Float32Array.of(3, 5));
+    sharedExecutor.releaseValues([sharedOutput]);
+    sharedExecutor.trim();
+    sharedInput.buffer.destroy();
+
     const remainingBuffers = [...liveBuffers()].filter((buffer) => !before.has(buffer));
     const report = {
       checkpointRevision:

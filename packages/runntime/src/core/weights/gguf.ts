@@ -1,4 +1,4 @@
-/** GGUF v3 header parsing and lazy F32/Q4_K/Q6_K tensor access. */
+/** GGUF v3 header parsing and lazy F16/F32/Q4_K/Q6_K/Q8_0 tensor access. */
 
 import { RunntimeError } from '../error.ts';
 import { f16ToF32 } from './convert.ts';
@@ -18,8 +18,10 @@ const CHUNK_BYTES = 2 * 1024 * 1024;
 const QK_BLOCK = 256;
 const Q4_K_BYTES = 144;
 const Q6_K_BYTES = 210;
+const Q8_0_BLOCK = 32;
+const Q8_0_BYTES = 34;
 
-export type GgufTensorType = 'F32' | 'Q4_K' | 'Q6_K';
+export type GgufTensorType = 'F16' | 'F32' | 'Q4_K' | 'Q6_K' | 'Q8_0';
 
 export interface GgufTensorInfo {
   readonly name: string;
@@ -185,7 +187,17 @@ function tensorBytes(type: GgufTensorType, shape: readonly number[]): number {
     }
     return next;
   }, 1);
+  if (type === 'F16') return elements * 2;
   if (type === 'F32') return elements * 4;
+  if (type === 'Q8_0') {
+    if (elements % Q8_0_BLOCK !== 0) {
+      throw new RunntimeError(
+        'CHECKPOINT_MISMATCH',
+        `GGUF ${type} tensor has ${elements} elements, not a multiple of ${Q8_0_BLOCK}`,
+      );
+    }
+    return (elements / Q8_0_BLOCK) * Q8_0_BYTES;
+  }
   if (elements % QK_BLOCK !== 0) {
     throw new RunntimeError(
       'CHECKPOINT_MISMATCH',
@@ -287,7 +299,17 @@ export async function parseGgufHeader(source: RangeSource, fileBytes: number): P
     }
     const rawType = reader.u32();
     const type: GgufTensorType | undefined =
-      rawType === 0 ? 'F32' : rawType === 12 ? 'Q4_K' : rawType === 14 ? 'Q6_K' : undefined;
+      rawType === 0
+        ? 'F32'
+        : rawType === 1
+          ? 'F16'
+          : rawType === 8
+            ? 'Q8_0'
+            : rawType === 12
+              ? 'Q4_K'
+              : rawType === 14
+                ? 'Q6_K'
+                : undefined;
     if (!type) {
       throw new RunntimeError(
         'CHECKPOINT_MISMATCH',
@@ -330,46 +352,80 @@ function fp16(view: DataView, offset: number): number {
   return f16ToF32(bits)[0]!;
 }
 
+function sharedTensorParts<T>(
+  info: GgufTensorInfo,
+  source: RangeSource,
+  count: number,
+  decode: (bytes: Uint8Array) => T,
+): (part: number) => Promise<T> {
+  let pending: Promise<T> | undefined;
+  const consumed = new Set<number>();
+  return async (part) => {
+    let current = pending;
+    if (!current) {
+      current = source.read(info.begin, info.end).then((bytes) => {
+        if (bytes.byteLength !== info.end - info.begin) {
+          throw new RunntimeError(
+            'LOAD_FAILED',
+            `GGUF tensor '${info.name}' returned a short read`,
+          );
+        }
+        return decode(bytes);
+      });
+      pending = current;
+      current.catch(() => {
+        if (pending === current) pending = undefined;
+      });
+    }
+    const result = await current;
+    consumed.add(part);
+    if (consumed.size === count) {
+      pending = undefined;
+      consumed.clear();
+    }
+    return result;
+  };
+}
+
 function q4Tensor(info: GgufTensorInfo, source: RangeSource): ReturnType<typeof quantTensor> {
   const elements = info.shape.reduce((product, dimension) => product * dimension, 1);
   const blocks = elements / QK_BLOCK;
-  const groups = elements / 32;
-  const scales = new Float32Array(groups);
-  const offsets = new Float32Array(groups);
-  let affineRead: Promise<void> | undefined;
-  const readAffines = async (): Promise<void> => {
-    if (affineRead) return affineRead;
-    affineRead = (async () => {
-      const data = await source.read(info.begin, info.end);
-      if (data.byteLength !== info.end - info.begin) {
-        throw new RunntimeError('LOAD_FAILED', `GGUF tensor '${info.name}' returned a short read`);
-      }
-      const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
-      for (let block = 0; block < blocks; block++) {
-        const base = block * Q4_K_BYTES;
-        const scaleOffset = base + 4;
-        const d = fp16(view, base);
-        const dmin = fp16(view, base + 2);
-        for (let group = 0; group < 8; group++) {
-          let scale: number;
-          let minimum: number;
-          if (group < 4) {
-            scale = data[scaleOffset + group]! & 63;
-            minimum = data[scaleOffset + group + 4]! & 63;
-          } else {
-            scale =
-              (data[scaleOffset + group + 4]! & 15) | ((data[scaleOffset + group - 4]! >> 6) << 4);
-            minimum =
-              (data[scaleOffset + group + 4]! >> 4) | ((data[scaleOffset + group]! >> 6) << 4);
-          }
-          const index = block * 8 + group;
-          scales[index] = d * scale;
-          offsets[index] = d * scale * 8 - dmin * minimum;
+  const readPart = sharedTensorParts(info, source, 3, (data) => {
+    const groups = elements / 32;
+    const scales = new Float32Array(groups);
+    const offsets = new Float32Array(groups);
+    const ints = new Int8Array(elements);
+    const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+    for (let block = 0; block < blocks; block++) {
+      const base = block * Q4_K_BYTES;
+      const scaleOffset = base + 4;
+      const d = fp16(view, base);
+      const dmin = fp16(view, base + 2);
+      for (let group = 0; group < 8; group++) {
+        let scale: number;
+        let minimum: number;
+        if (group < 4) {
+          scale = data[scaleOffset + group]! & 63;
+          minimum = data[scaleOffset + group + 4]! & 63;
+        } else {
+          scale =
+            (data[scaleOffset + group + 4]! & 15) | ((data[scaleOffset + group - 4]! >> 6) << 4);
+          minimum =
+            (data[scaleOffset + group + 4]! >> 4) | ((data[scaleOffset + group]! >> 6) << 4);
+        }
+        const index = block * 8 + group;
+        scales[index] = d * scale;
+        offsets[index] = d * scale * 8 - dmin * minimum;
+        const qOffset = base + 16 + (group >> 1) * 32;
+        const high = group % 2 === 1;
+        for (let value = 0; value < 32; value++) {
+          const byte = data[qOffset + value]!;
+          ints[block * QK_BLOCK + group * 32 + value] = (high ? byte >> 4 : byte & 15) - 8;
         }
       }
-    })();
-    return affineRead;
-  };
+    }
+    return { ints, scales, offsets };
+  });
   return quantTensor({
     name: info.name,
     shape: info.shape,
@@ -377,33 +433,13 @@ function q4Tensor(info: GgufTensorInfo, source: RangeSource): ReturnType<typeof 
     groupSize: 32,
     byteLength: info.end - info.begin,
     async ints() {
-      const data = await source.read(info.begin, info.end);
-      if (data.byteLength !== info.end - info.begin) {
-        throw new RunntimeError('LOAD_FAILED', `GGUF tensor '${info.name}' returned a short read`);
-      }
-      const out = new Int8Array(elements);
-      for (let block = 0; block < blocks; block++) {
-        const base = block * Q4_K_BYTES;
-        const quant = base + 16;
-        for (let group = 0; group < 8; group++) {
-          const qOffset = quant + (group >> 1) * 32;
-          const high = group % 2 === 1;
-          for (let index = 0; index < 32; index++) {
-            const byte = data[qOffset + index]!;
-            const quantized = high ? byte >> 4 : byte & 15;
-            out[block * QK_BLOCK + group * 32 + index] = quantized - 8;
-          }
-        }
-      }
-      return out;
+      return (await readPart(0)).ints;
     },
     async scales() {
-      await readAffines();
-      return scales;
+      return (await readPart(1)).scales;
     },
     async offsets() {
-      await readAffines();
-      return offsets;
+      return (await readPart(2)).offsets;
     },
   });
 }
@@ -412,26 +448,37 @@ function q6Tensor(info: GgufTensorInfo, source: RangeSource): ReturnType<typeof 
   const elements = info.shape.reduce((product, dimension) => product * dimension, 1);
   const blocks = elements / QK_BLOCK;
   const groupSize = 16;
-  const groups = new Float32Array(elements / groupSize);
-  let scaleRead: Promise<void> | undefined;
-  const readScales = async (): Promise<void> => {
-    if (scaleRead) return scaleRead;
-    scaleRead = (async () => {
-      const data = await source.read(info.begin, info.end);
-      if (data.byteLength !== info.end - info.begin) {
-        throw new RunntimeError('LOAD_FAILED', `GGUF tensor '${info.name}' returned a short read`);
+  const readPart = sharedTensorParts(info, source, 2, (data) => {
+    const groups = new Float32Array(elements / groupSize);
+    const ints = new Int8Array(elements);
+    const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+    for (let block = 0; block < blocks; block++) {
+      const base = block * Q6_K_BYTES;
+      const ql = base;
+      const qh = base + 128;
+      const d = fp16(view, base + 208);
+      for (let group = 0; group < 16; group++) {
+        groups[block * 16 + group] = d * view.getInt8(base + 192 + group);
       }
-      const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
-      for (let block = 0; block < blocks; block++) {
-        const base = block * Q6_K_BYTES;
-        const d = fp16(view, base + 208);
-        for (let group = 0; group < 16; group++) {
-          groups[block * 16 + group] = d * view.getInt8(base + 192 + group);
+      for (let half = 0; half < 2; half++) {
+        for (let sub = 0; sub < 4; sub++) {
+          const lowOffset = ql + half * 64 + (sub % 2) * 32;
+          const highOffset = qh + half * 32;
+          const highNibble = sub >= 2;
+          const highShift = sub * 2;
+          for (let index = 0; index < 32; index++) {
+            const low = data[lowOffset + index]!;
+            const high = data[highOffset + index]!;
+            const nibble = highNibble ? low >> 4 : low & 15;
+            const value = nibble | (((high >> highShift) & 3) << 4);
+            const output = block * QK_BLOCK + half * 128 + sub * 32 + index;
+            ints[output] = value - 32;
+          }
         }
       }
-    })();
-    return scaleRead;
-  };
+    }
+    return { ints, scales: groups };
+  });
   return quantTensor({
     name: info.name,
     shape: info.shape,
@@ -439,37 +486,41 @@ function q6Tensor(info: GgufTensorInfo, source: RangeSource): ReturnType<typeof 
     groupSize,
     byteLength: info.end - info.begin,
     async ints() {
-      const data = await source.read(info.begin, info.end);
-      if (data.byteLength !== info.end - info.begin) {
-        throw new RunntimeError('LOAD_FAILED', `GGUF tensor '${info.name}' returned a short read`);
-      }
-      const out = new Int8Array(elements);
-      for (let block = 0; block < blocks; block++) {
-        const base = block * Q6_K_BYTES;
-        const ql = base;
-        const qh = base + 128;
-        for (let half = 0; half < 2; half++) {
-          for (let sub = 0; sub < 4; sub++) {
-            const lowOffset = ql + half * 64 + (sub % 2) * 32;
-            const highOffset = qh + half * 32;
-            const highNibble = sub >= 2;
-            const highShift = sub * 2;
-            for (let index = 0; index < 32; index++) {
-              const low = data[lowOffset + index]!;
-              const high = data[highOffset + index]!;
-              const nibble = highNibble ? low >> 4 : low & 15;
-              const value = nibble | (((high >> highShift) & 3) << 4);
-              const output = block * QK_BLOCK + half * 128 + sub * 32 + index;
-              out[output] = value - 32;
-            }
-          }
-        }
-      }
-      return out;
+      return (await readPart(0)).ints;
     },
     async scales() {
-      await readScales();
-      return groups;
+      return (await readPart(1)).scales;
+    },
+  });
+}
+
+function q8_0Tensor(info: GgufTensorInfo, source: RangeSource): ReturnType<typeof quantTensor> {
+  const elements = info.shape.reduce((product, dimension) => product * dimension, 1);
+  const blocks = elements / Q8_0_BLOCK;
+  const readPart = sharedTensorParts(info, source, 2, (data) => {
+    const scales = new Float32Array(blocks);
+    const ints = new Int8Array(elements);
+    const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+    for (let block = 0; block < blocks; block++) {
+      const base = block * Q8_0_BYTES;
+      scales[block] = fp16(view, base);
+      for (let index = 0; index < Q8_0_BLOCK; index++) {
+        ints[block * Q8_0_BLOCK + index] = view.getInt8(base + 2 + index);
+      }
+    }
+    return { ints, scales };
+  });
+  return quantTensor({
+    name: info.name,
+    shape: info.shape,
+    bits: 8,
+    groupSize: Q8_0_BLOCK,
+    byteLength: info.end - info.begin,
+    async ints() {
+      return (await readPart(0)).ints;
+    },
+    async scales() {
+      return (await readPart(1)).scales;
     },
   });
 }
@@ -477,15 +528,23 @@ function q6Tensor(info: GgufTensorInfo, source: RangeSource): ReturnType<typeof 
 function ggufTensor(info: GgufTensorInfo, source: RangeSource) {
   if (info.type === 'Q4_K') return q4Tensor(info, source);
   if (info.type === 'Q6_K') return q6Tensor(info, source);
-  const elements = info.shape.reduce((product, dimension) => product * dimension, 1);
+  if (info.type === 'Q8_0') return q8_0Tensor(info, source);
   return derivedTensor(
     info.shape,
     async () => {
       const bytes = await source.read(info.begin, info.end);
+      if (bytes.byteLength !== info.end - info.begin) {
+        throw new RunntimeError('LOAD_FAILED', `GGUF tensor '${info.name}' returned a short read`);
+      }
+      if (info.type === 'F16') {
+        return f16ToF32(
+          new Uint16Array(
+            bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength),
+          ),
+        );
+      }
       return new Float32Array(
         bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength),
-        0,
-        elements,
       );
     },
     info.end - info.begin,

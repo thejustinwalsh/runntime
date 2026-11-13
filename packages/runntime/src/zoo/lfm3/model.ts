@@ -572,7 +572,12 @@ export class Lfm3CausalLM extends nn.Module<
     sd.tensors.set('lm_head.weight', embedding);
   }
 
-  forward(ids: readonly number[], root: TgpuRoot, previous?: Lfm3Cache): Lfm3ModelStep {
+  forward(
+    ids: readonly number[],
+    root: TgpuRoot,
+    previous?: Lfm3Cache,
+    ownedUploads: Value[] = [],
+  ): Lfm3ModelStep {
     if (ids.length === 0) {
       throw new RunntimeError('INVALID_ARGUMENT', 'LFM3 forward needs at least one input token');
     }
@@ -583,7 +588,7 @@ export class Lfm3CausalLM extends nn.Module<
         `LFM3 context exhausted: ${position + ids.length} > ${LFM3.maxContext}`,
       );
     }
-    const uploads: Value[] = [];
+    const uploads = ownedUploads;
     const embedding = track(this.model.embed_tokens.forward(ids, root), uploads);
     const result = this.model.forward(embedding, ids.length, position, previous, root, uploads);
     const final = slice(result.hidden, 0, ids.length - 1, ids.length);

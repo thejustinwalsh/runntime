@@ -203,4 +203,41 @@ describe('LFM3 streaming session', () => {
     await expect(generation[Symbol.asyncIterator]().next()).rejects.toThrow('GPU readback failed');
     await session.dispose();
   });
+
+  it.each(['invalid logits', 'GPU out-of-memory'] as const)(
+    'propagates %s to the stream and result without poisoning an independent session',
+    async (failure) => {
+      const runtime = {
+        async forward() {
+          if (failure === 'invalid logits') {
+            return { logits: new Float32Array(1), cache: { id: 1 } };
+          }
+          throw new RunntimeError('EXECUTION_FAILED', 'GPU out-of-memory');
+        },
+        release() {},
+        trim() {},
+        dispose() {},
+      } satisfies Lfm3SessionRuntime<{ id: number }>;
+      const session = createLfm3Session(
+        {
+          bosId: 1,
+          stopIds: new Set([124_900]),
+          encodeChat: () => [1],
+          decode: () => '',
+        },
+        runtime,
+      );
+      const failed = session.generate([{ role: 'user', content: 'fail' }]);
+      await expect(failed.result).rejects.toMatchObject({ code: 'EXECUTION_FAILED' });
+      await expect(failed[Symbol.asyncIterator]().next()).rejects.toMatchObject({
+        code: 'EXECUTION_FAILED',
+      });
+      await session.dispose();
+
+      const independent = fixture({ tokens: [7, 124_900] });
+      const fresh = independent.session.generate([{ role: 'user', content: 'remain usable' }]);
+      await expect(fresh.result).resolves.toMatchObject({ text: 'A', finishReason: 'stop' });
+      await independent.session.dispose();
+    },
+  );
 });

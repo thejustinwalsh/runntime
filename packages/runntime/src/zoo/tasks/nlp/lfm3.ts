@@ -73,6 +73,7 @@ export async function createLfm3Chat(
   const runtime: Lfm3SessionRuntime<Lfm3Cache> = {
     async forward(ids: readonly number[], previous: Lfm3Cache | undefined, signal: AbortSignal) {
       let step: ReturnType<Lfm3CausalLM['forward']> | undefined;
+      const uploads: Value[] = [];
       try {
         if (signal.aborted) {
           throw new RunntimeError('EXECUTION_FAILED', 'LFM3 generation aborted', {
@@ -80,7 +81,7 @@ export async function createLfm3Chat(
           });
         }
         const result = await inGpuErrorScopes(root.device, 'LFM3 generation', async () => {
-          const current = model.forward(ids, root, previous);
+          const current = model.forward(ids, root, previous, uploads);
           step = current;
           evalValues([current.logits, ...cacheValues(current.cache)], executor);
           const logits = await toArray(current.logits, executor);
@@ -106,7 +107,7 @@ export async function createLfm3Chat(
         if (step) executor.releaseValues([step.logits, ...cacheValues(step.cache)]);
         throw rethrowRunError(error);
       } finally {
-        if (step) destroyUploads(step.uploads);
+        destroyUploads(uploads);
       }
     },
     async release(cache: Lfm3Cache) {
