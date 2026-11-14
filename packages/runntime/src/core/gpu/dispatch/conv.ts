@@ -143,17 +143,16 @@ export const depthwiseConv1dSpec = defineSpec({
   cfg: (node, attrs) => ({
     channels: node.pending!.inputs[0]!.shape.dims![1]!,
     kernel: attrs.kernel,
-    padLeft: attrs.padLeft,
   }),
   pipeline: (root, dtype, cfg) => createDepthwiseConv1dPipeline(root, cfg, elemFor(dtype)),
-  encode: ({ node, pipeline, inputs, out, ctx }) => {
+  encode: ({ node, attrs, pipeline, inputs, out, ctx }) => {
     const [rowsIn] = node.pending!.inputs[0]!.shape.dims as [number, number];
     const [rowsOut, channels] = node.shape.dims as [number, number];
     return [
       depthwiseConv1dHandle(
         ctx.root,
         pipeline,
-        { rowsIn, rowsOut, channels },
+        { rowsIn, rowsOut, channels, padLeft: attrs.padLeft },
         {
           x: narrowFloat(inputs[0]!, node.shape.dtype),
           w: narrowFloat(inputs[1]!, node.shape.dtype),
