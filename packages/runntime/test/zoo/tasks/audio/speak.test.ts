@@ -13,6 +13,8 @@
 
 import { describe, expect, it, vi } from 'vitest';
 
+const fault = vi.hoisted(() => ({ failNextForward: false }));
+
 vi.mock('../../../../src/core/index.ts', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../../../src/core/index.ts')>();
   return {
@@ -59,11 +61,17 @@ vi.mock('../../../../src/zoo/tasks/nlp/lfm3.ts', () => ({
       hidden: new Float32Array(2048).fill(0.1),
       cache: {},
     }),
-    forwardTokens: async () => ({
-      logits: new Float32Array(4),
-      hidden: new Float32Array(2048).fill(0.1),
-      cache: {},
-    }),
+    forwardTokens: async () => {
+      if (fault.failNextForward) {
+        fault.failNextForward = false;
+        throw new Error('injected language forward failure');
+      }
+      return {
+        logits: new Float32Array(4),
+        hidden: new Float32Array(2048).fill(0.1),
+        cache: {},
+      };
+    },
   }),
 }));
 
@@ -171,6 +179,29 @@ describe('public audio speech stream', () => {
       const result = await next.result;
       expect(result.audioFrames).toBe(2);
       expect(result.samples.length).toBeGreaterThan(0);
+      expect([...result.samples].every(Number.isFinite)).toBe(true);
+    } finally {
+      await audio.dispose();
+    }
+  });
+
+  it('rejects a failed speech result and runs its already-queued successor', async () => {
+    const audio = await createLfm3Audio(
+      { projectorPath: { read: async () => new Uint8Array() } },
+      { warmUp: false },
+    );
+    try {
+      fault.failNextForward = true;
+      const failed = audio.speak('injected failure', { maxAudioFrames: 1, temperature: 0 });
+      const queued = audio.speak('queued recovery', { maxAudioFrames: 1, temperature: 0 });
+
+      await expect(failed.result).rejects.toMatchObject({ code: 'EXECUTION_FAILED' });
+      const chunks: Float32Array[] = [];
+      for await (const chunk of queued) chunks.push(chunk);
+      const result = await queued.result;
+
+      expect(chunks.length).toBeGreaterThan(0);
+      expect(result.audioFrames).toBe(1);
       expect([...result.samples].every(Number.isFinite)).toBe(true);
     } finally {
       await audio.dispose();
