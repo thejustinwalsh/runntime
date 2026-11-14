@@ -198,6 +198,8 @@ interface AudioReferenceResult {
   readonly speechTranscription: {
     readonly text: string;
     readonly normalizedText: string;
+    readonly sampleRate: number;
+    readonly samples: number;
     readonly promptTokens: number;
     readonly generatedTokens: number;
     readonly recoversRequestedText: boolean;
@@ -418,8 +420,9 @@ async function captureAudioReferences(
     if (saved.status !== 204)
       throw new Error(`failed to save Liquid speech fixture: HTTP ${saved.status}`);
 
+    const speechTranscriptionSamples = await resampleAudio(speechSamples, speechSampleRate);
     const speechTranscription = await streamLiquidTokens(audioModel, reference, {
-      samples: speechSamples,
+      samples: speechTranscriptionSamples,
       prompt: '',
       maxNewTokens: 128,
     });
@@ -463,6 +466,8 @@ async function captureAudioReferences(
       speechTranscription: {
         text: speechTranscript,
         normalizedText: normalizeWords(speechTranscript),
+        sampleRate: 16_000,
+        samples: speechTranscriptionSamples.length,
         promptTokens: speechTranscription.inputTokens,
         generatedTokens: speechTranscription.tokenIds.length,
         recoversRequestedText:
@@ -639,6 +644,7 @@ it.skipIf(MODE !== 'liquid-reference')(
         expect(fixture.liquidSpeech.sampleRate).toBe(24_000);
         expect(fixture.liquidSpeech.finiteNonempty).toBe(true);
         expect(fixture.liquidSpeech.speechFrames).toBeGreaterThan(0);
+        expect(fixture.speechTranscription.sampleRate).toBe(16_000);
       }
       expect(
         audioFixtures.every((fixture) => fixture.speechTranscription.recoversRequestedText),
