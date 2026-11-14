@@ -9,6 +9,7 @@ import {
   inGpuErrorScopes,
   isRunntimeError,
   RunntimeError,
+  toArray,
   warmUp,
   type RangeSource,
   type RunntimeExecutor,
@@ -114,22 +115,19 @@ export async function loadLfm3Backbone(
       const result = await inGpuErrorScopes(root.device, 'LFM3 generation', async () => {
         const current = create(uploads);
         step = current;
-        // Fuse the logits (and hidden, when requested) readback into the eval's
-        // own submit: one submit and one batched map round-trip instead of one
-        // submit plus separate readbacks. Cache targets ride the same eval so
-        // they stay materialized; a submit failure rejects the pending copy
-        // through the shared ReadbackQueue.
-        const pending = executor.readbackManyOnSubmit(
-          readHidden ? [current.logits, current.hidden] : [current.logits],
-        );
-        pending.catch(() => undefined);
+        // Readbacks stay unfused: the logits (and hidden) copy runs after the
+        // eval's own submit. Queuing a fused readback before evalValues leaves
+        // the shared ReadbackQueue occupied when graph collection, allocation
+        // or dispatch throws pre-submit, and the next request then fails with
+        // 'a readback is already queued'. toArray rejects a pending readback
+        // when its own eval fails, so this separate-submit path recovers.
         evalValues(
           [current.logits, ...(readHidden ? [current.hidden] : []), ...cacheValues(current.cache)],
           executor,
         );
-        const outs = await pending;
-        const logits = outs[0]!;
-        const hidden = outs[1];
+        const logitsPromise = toArray(current.logits, executor);
+        const hiddenPromise = readHidden ? toArray(current.hidden, executor) : undefined;
+        const [logits, hidden] = await Promise.all([logitsPromise, hiddenPromise]);
         await releaseAfterWork();
         if (signal.aborted) {
           throw new RunntimeError('EXECUTION_FAILED', 'LFM3 generation aborted', {
