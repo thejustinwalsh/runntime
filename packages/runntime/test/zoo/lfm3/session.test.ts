@@ -256,4 +256,77 @@ describe('LFM3 streaming session', () => {
       await independent.session.dispose();
     },
   );
+
+  it('recovers the same session after a failed generation', async () => {
+    let calls = 0;
+    const runtime: Lfm3SessionRuntime<{ id: number }> = {
+      async forward(_ids, _cache, signal) {
+        calls++;
+        if (signal.aborted) throw new Error('unexpected call after abort');
+        if (calls === 1) throw new RunntimeError('EXECUTION_FAILED', 'injected pre-submit failure');
+        const logits = new Float32Array(LFM3.vocab).fill(-1);
+        logits[7] = 1;
+        return { logits, cache: { id: calls } };
+      },
+      release() {},
+      trim() {},
+      dispose() {},
+    };
+    const session = createLfm3Session(
+      {
+        bosId: 1,
+        audioId: 2,
+        audioOutId: 3,
+        audioStartId: 4,
+        textEndId: 125_014,
+        stopIds: new Set([124_900]),
+        encodeChat: () => [1],
+        decode: (ids) => (ids.includes(7) ? 'A' : ''),
+      },
+      runtime,
+    );
+    const failed = session.generate([{ role: 'user', content: 'first' }], { maxNewTokens: 1 });
+    await expect(failed.result).rejects.toMatchObject({ code: 'EXECUTION_FAILED' });
+    await expect(failed[Symbol.asyncIterator]().next()).rejects.toMatchObject({
+      code: 'EXECUTION_FAILED',
+    });
+    const next = session.generate([{ role: 'user', content: 'second' }], { maxNewTokens: 1 });
+    await expect(next.result).resolves.toMatchObject({ text: 'A', completionTokens: 1 });
+    for await (const _update of next) {
+      // Drain the stream; the generation already resolved above.
+    }
+    await session.dispose();
+  });
+
+  it('settles a stream-only early break without an unhandled rejection', async () => {
+    const runtime = {
+      async forward() {
+        throw new RunntimeError('EXECUTION_FAILED', 'injected readback failure');
+      },
+      release: () => {},
+      trim: () => {},
+      dispose: () => {},
+    } satisfies Lfm3SessionRuntime<never>;
+    const session = createLfm3Session(
+      {
+        bosId: 1,
+        audioId: 2,
+        audioOutId: 3,
+        audioStartId: 4,
+        textEndId: 125_014,
+        stopIds: new Set([124_900]),
+        encodeChat: () => [1],
+        decode: () => '',
+      },
+      runtime,
+    );
+    // A stream-only consumer abandons the iterator without awaiting result.
+    // The internal observer must hold the rejection so it never surfaces as
+    // an unhandled rejection; awaiting result later still observes it.
+    const generation = session.generate([{ role: 'user', content: 'hello' }]);
+    generation[Symbol.asyncIterator]();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    await expect(generation.result).rejects.toMatchObject({ code: 'EXECUTION_FAILED' });
+    await session.dispose();
+  });
 });
