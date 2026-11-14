@@ -159,4 +159,50 @@ describe('LFM3 checkpoint transforms', () => {
       expect.objectContaining({ code: 'CHECKPOINT_MISMATCH' }),
     );
   });
+
+  it('fuses the MLP gate/up pair into one packed projection', async () => {
+    const model = new Lfm3CausalLM();
+    const sd = stateDict({
+      'model.language_model.embed_tokens.weight': floats([LFM3.vocab, LFM3.hidden]),
+      'model.language_model.layers.0.feed_forward.w1.weight': floats(
+        [LFM3.ffn, LFM3.hidden],
+        (index) => index,
+      ),
+      'model.language_model.layers.0.feed_forward.w3.weight': floats(
+        [LFM3.ffn, LFM3.hidden],
+        (index) => 1_000_000 + index,
+      ),
+    });
+    model.transformStateDict(sd);
+    expect(sd.tensors.has('model.layers.0.feed_forward.w1.weight')).toBe(false);
+    expect(sd.tensors.has('model.layers.0.feed_forward.w3.weight')).toBe(false);
+    const packed = sd.tensors.get('model.layers.0.feed_forward.w13.weight')!;
+    expect(packed.shape).toEqual([2 * LFM3.ffn, LFM3.hidden]);
+    const values = await packed.f32();
+    // Hidden first (w3), gate second (w1): first row comes from w3, second half from w1.
+    expect(values[0]).toBe(1_000_000);
+    expect(values[LFM3.ffn * LFM3.hidden]).toBe(0);
+  });
+
+  it('keeps quantized MLP pairs packed without dequantizing', async () => {
+    const model = new Lfm3CausalLM();
+    const sd = stateDict({
+      'model.language_model.embed_tokens.weight': floats([LFM3.vocab, LFM3.hidden]),
+      'model.language_model.layers.1.feed_forward.w1.weight': qTensor(
+        [LFM3.ffn, LFM3.hidden],
+        4,
+        32,
+      ),
+      'model.language_model.layers.1.feed_forward.w3.weight': qTensor(
+        [LFM3.ffn, LFM3.hidden],
+        4,
+        32,
+      ),
+    });
+    model.transformStateDict(sd);
+    const packed = sd.tensors.get('model.layers.1.feed_forward.w13.weight')!;
+    expect(packed.kind).toBe('quant');
+    expect(packed.shape).toEqual([2 * LFM3.ffn, LFM3.hidden]);
+    expect(sd.tensors.has('model.layers.1.feed_forward.w1.weight')).toBe(false);
+  });
 });

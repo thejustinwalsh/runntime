@@ -3,25 +3,29 @@
 
 import type { TgpuRoot } from 'typegpu';
 import {
-  add,
   cat,
   chunk,
   depthwiseConv1d,
   mul,
   nn,
-  reshape,
+  rmsNorm,
   RunntimeError,
   rope,
   sdpa,
   sigmoid,
-  silu,
   slice,
+  swigluChunk,
   tensor,
   type LazyStateDict,
   type LazyTensor,
   type Value,
 } from '../../core/index.ts';
-import { permuteRows, reshapeWeight, splitRows } from '../../core/weights/transforms.ts';
+import {
+  concatRows,
+  permuteRows,
+  reshapeWeight,
+  splitRows,
+} from '../../core/weights/transforms.ts';
 import { checkpointMismatch } from '../errors.ts';
 
 /** Pinned architecture constants for Liquid's original text checkpoint. */
@@ -251,12 +255,12 @@ function appendRows(previous: Value | undefined, current: Value): Value {
 }
 
 class Lfm3Mlp extends nn.Module<[Value], Value> {
-  readonly w1 = new nn.Linear(LFM3.hidden, LFM3.ffn, { bias: false });
-  readonly w3 = new nn.Linear(LFM3.hidden, LFM3.ffn, { bias: false });
+  /** w3 rows then w1 rows: swigluChunk reads hidden first, gate second. */
+  readonly w13 = new nn.Linear(LFM3.hidden, 2 * LFM3.ffn, { bias: false });
   readonly w2 = new nn.Linear(LFM3.ffn, LFM3.hidden, { bias: false });
 
   override forward(x: Value): Value {
-    return this.w2.forward(mul(silu(this.w1.forward(x)), this.w3.forward(x)));
+    return this.w2.forward(swigluChunk(this.w13.forward(x)));
   }
 }
 
@@ -285,16 +289,13 @@ class Lfm3Attention extends nn.Module<
     fullRope: { cos: Value; sin: Value },
     slidingRope: { cos: Value; sin: Value },
   ): { output: Value; cache: Lfm3AttentionCache } {
-    const rows = x.shape.dims![0]!;
     const layerType = LFM3.layerTypes[layer]!;
-    const q = reshape(
-      this.q_norm.forward(reshape(this.q_proj.forward(x), [rows * LFM3.heads, LFM3.headDim])),
-      [rows, LFM3.heads * LFM3.headDim],
-    );
-    const k = reshape(
-      this.k_norm.forward(reshape(this.k_proj.forward(x), [rows * LFM3.kvHeads, LFM3.headDim])),
-      [rows, LFM3.kvHeads * LFM3.headDim],
-    );
+    const q = rmsNorm(this.q_proj.forward(x), this.q_norm.scale.value, LFM3.eps, {
+      group: LFM3.headDim,
+    });
+    const k = rmsNorm(this.k_proj.forward(x), this.k_norm.scale.value, LFM3.eps, {
+      group: LFM3.headDim,
+    });
     const tables = layerType === 'full_attention' ? fullRope : slidingRope;
     const rotatedQ = rope(q, tables.cos, tables.sin, { headDim: LFM3.headDim });
     const rotatedK = rope(k, tables.cos, tables.sin, { headDim: LFM3.headDim });
@@ -416,12 +417,15 @@ class Lfm3Layer extends nn.Module<
       op = result.output;
       convolution = result.cache;
     }
-    hidden = add(this.post_operator_norm.forward(op), residual);
-    const feedForward = this.post_ffn_norm.forward(
+    hidden = rmsNorm(op, this.post_operator_norm.scale.value, LFM3.eps, { residual });
+    const feedForward = rmsNorm(
       this.feed_forward.forward(this.ffn_norm.forward(hidden)),
+      this.post_ffn_norm.scale.value,
+      LFM3.eps,
+      { residual: hidden },
     );
     return {
-      hidden: add(hidden, feedForward),
+      hidden: feedForward,
       attention,
       convolution,
     };
@@ -562,6 +566,22 @@ export class Lfm3CausalLM extends nn.Module<
         tensor = permuteRows(tensor, NORM_ORDER);
       }
       sd.tensors.set(`model.${targetName}`, tensor);
+    }
+    for (let layer = 0; layer < LFM3.layers; layer++) {
+      const w1 = sd.tensors.get(`model.layers.${layer}.feed_forward.w1.weight`);
+      const w3 = sd.tensors.get(`model.layers.${layer}.feed_forward.w3.weight`);
+      if (w1 && w3) {
+        sd.tensors.set(`model.layers.${layer}.feed_forward.w13.weight`, concatRows([w3, w1]));
+        sd.tensors.delete(`model.layers.${layer}.feed_forward.w1.weight`);
+        sd.tensors.delete(`model.layers.${layer}.feed_forward.w3.weight`);
+      } else if ((w1 && !w3) || (!w1 && w3)) {
+        throw checkpointMismatch(
+          'LFM3 checkpoint',
+          `has an incomplete model.layers.${layer}.feed_forward.w1/w3 pair`,
+        );
+      }
+      // Partial test fixtures may omit MLP weights entirely; the loader reports
+      // a missing w13 then, preserving the previous missing-weight failure.
     }
     if (!embedding) {
       throw checkpointMismatch(
