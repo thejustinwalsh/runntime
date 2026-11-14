@@ -17,6 +17,10 @@ function fixture(
   let disposed = false;
   const tokenizer: Lfm3Tokenizer = {
     bosId: 1,
+    audioId: 2,
+    audioOutId: 3,
+    audioStartId: 4,
+    textEndId: 125_014,
     stopIds: new Set([124_900, 125_014]),
     encodeChat(_messages: readonly Lfm3Message[]) {
       return Array.from({ length: options.promptLength ?? 2 }, (_, i) => i + 1);
@@ -165,6 +169,10 @@ describe('LFM3 streaming session', () => {
     const session = createLfm3Session(
       {
         bosId: 1,
+        audioId: 2,
+        audioOutId: 3,
+        audioStartId: 4,
+        textEndId: 125_014,
         stopIds: new Set([124_900]),
         encodeChat: () => [1],
         decode: (ids) => (ids.includes(7) ? 'A' : ''),
@@ -192,6 +200,10 @@ describe('LFM3 streaming session', () => {
     const session = createLfm3Session(
       {
         bosId: 1,
+        audioId: 2,
+        audioOutId: 3,
+        audioStartId: 4,
+        textEndId: 125_014,
         stopIds: new Set([124_900]),
         encodeChat: () => [1],
         decode: () => '',
@@ -221,6 +233,10 @@ describe('LFM3 streaming session', () => {
       const session = createLfm3Session(
         {
           bosId: 1,
+          audioId: 2,
+          audioOutId: 3,
+          audioStartId: 4,
+          textEndId: 125_014,
           stopIds: new Set([124_900]),
           encodeChat: () => [1],
           decode: () => '',

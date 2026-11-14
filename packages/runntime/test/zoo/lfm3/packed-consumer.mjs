@@ -24,6 +24,7 @@ const packageDirectory = resolve(scriptDirectory, '../../..');
 const repositoryDirectory = resolve(packageDirectory, '../..');
 const modelUrl =
   process.env.LFM3_MODEL_URL ?? process.env.LFM3_BASE_MODEL_URL ?? process.env.LFM3_Q4_MODEL_URL;
+const audioProjectorUrl = process.env.LFM3_PROJECTOR_URL;
 const tokenizerUrl = process.env.LFM3_BASE_TOKENIZER_URL;
 const reportPath = process.env.LFM3_BASE_VITEST_REPORT;
 const qualificationMode = process.env.LFM3_BASE_QUALIFICATION_MODE ?? 'base';
@@ -33,7 +34,11 @@ const liquidModelUrl = process.env.LFM3_LIQUID_MODEL_URL ?? modelUrl;
 const liquidProjectorUrl = process.env.LFM3_LIQUID_PROJECTOR_URL;
 const liquidAudioInputBaseUrl = process.env.LFM3_LIQUID_AUDIO_INPUT_BASE_URL;
 const liquidAudioOutputDirectory = process.env.LFM3_LIQUID_AUDIO_OUTPUT_DIR;
+const nativeAudioInputFile = process.env.LFM3_NATIVE_AUDIO_INPUT_FILE;
+const nativeAudioInputBaseUrl = process.env.LFM3_AUDIO_INPUT_BASE_URL ?? liquidAudioInputBaseUrl;
+const nativeAudioOutputDirectory = process.env.LFM3_NATIVE_AUDIO_OUTPUT_DIR;
 const packedTestFile = process.env.LFM3_PACKED_TEST_FILE;
+const browserTrustedSpki = process.env.LFM3_BROWSER_TRUSTED_SPKI;
 const keepTemporaryDirectory = process.env.LFM3_KEEP_PACKED_TEMP === '1';
 
 const temporaryDirectory = mkdtempSync(join(tmpdir(), 'runntime-packed-lfm3-'));
@@ -100,10 +105,15 @@ try {
     'utf8',
   ).replace("from '../../../src/zoo/index.ts'", "from 'runntime/zoo'");
   writeFileSync(join(testDirectory, 'recovery.gpu.test.ts'), recoverySource);
+  const audioSource = readFileSync(
+    join(packageDirectory, 'test/zoo/lfm3/public-audio.gpu.test.ts'),
+    'utf8',
+  ).replace("from '../../../src/zoo/index.ts'", "from 'runntime/zoo'");
+  writeFileSync(join(testDirectory, 'public-audio.gpu.test.ts'), audioSource);
   const referenceSource = readFileSync(
     join(packageDirectory, 'test/zoo/lfm3/liquid-reference.gpu.test.ts'),
     'utf8',
-  );
+  ).replace("from '../../../src/zoo/index.ts'", "from 'runntime/zoo'");
   writeFileSync(join(testDirectory, 'liquid-reference.gpu.test.ts'), referenceSource);
   if (qualificationMode === 'liquid-reference') {
     if (!liquidEnginePath)
@@ -172,7 +182,7 @@ export function buffersSince(before) {
 
 let rootPromise;
 export function gpu() {
-  rootPromise ??= tgpu.init({ device: { optionalFeatures: ['subgroups'] } }).then((root) => {
+  rootPromise ??= tgpu.init({ device: { optionalFeatures: ['subgroups', 'shader-f16'] } }).then((root) => {
     initRunntime(root);
     return { root };
   });
@@ -186,8 +196,14 @@ export function gpu() {
     `import { playwright } from '@vitest/browser-playwright';
 import typegpu from 'unplugin-typegpu/vite';
 import { defineConfig } from 'vitest/config';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
+
+const browserArgs = ['--enable-unsafe-webgpu'];
+if (${JSON.stringify(browserTrustedSpki)}) {
+  browserArgs.push('--ignore-certificate-errors-spki-list=' + ${JSON.stringify(browserTrustedSpki)});
+}
+const serverPort = Number(process.env.PORT);
 
 export default defineConfig({
   plugins: [typegpu(), {
@@ -217,16 +233,49 @@ export default defineConfig({
           response.end();
         });
       });
+      server.middlewares.use('/__native-audio-output', (request, response) => {
+        if (request.method !== 'POST') { response.statusCode = 405; response.end(); return; }
+        const filename = basename(new URL(request.url ?? '/', 'http://localhost').pathname);
+        if (!/^native-speech-depth-[13]\\.wav$/.test(filename)) { response.statusCode = 400; response.end(); return; }
+        const chunks = [];
+        request.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
+        request.on('end', () => {
+          const output = join(${JSON.stringify(join(temporaryDirectory, 'native-audio'))}, filename);
+          mkdirSync(dirname(output), { recursive: true });
+          writeFileSync(output, Buffer.concat(chunks));
+          response.statusCode = 204;
+          response.end();
+        });
+      });
+      server.middlewares.use('/__native-audio-input', (request, response) => {
+        if (request.method !== 'GET') { response.statusCode = 405; response.end(); return; }
+        const filename = basename(new URL(request.url ?? '/', 'http://localhost').pathname);
+        if (filename !== 'native-speech-depth-3.wav' || !${JSON.stringify(nativeAudioInputFile ?? null)}) {
+          response.statusCode = 404;
+          response.end();
+          return;
+        }
+        const audio = readFileSync(${JSON.stringify(nativeAudioInputFile ?? '')});
+        response.setHeader('content-type', 'audio/wav');
+        response.setHeader('content-length', audio.byteLength);
+        response.end(audio);
+      });
     },
   }],
   optimizeDeps: { include: ['typegpu'] },
-  server: { fs: { allow: [${JSON.stringify(repositoryDirectory)}, ${JSON.stringify(temporaryDirectory)}] } },
+  server: {
+    fs: { allow: [${JSON.stringify(repositoryDirectory)}, ${JSON.stringify(temporaryDirectory)}] },
+    ...(process.env.PORTLESS_URL && Number.isInteger(serverPort) && serverPort > 0
+      ? { host: process.env.HOST, port: serverPort, strictPort: true }
+      : {}),
+    ...(process.env.PORTLESS_URL ? { origin: process.env.PORTLESS_URL } : {}),
+  },
   test: {
     include: ['test/**/*.gpu.test.ts'],
     browser: {
       enabled: true,
       headless: true,
-      provider: playwright({ launchOptions: { channel: 'chromium', args: ['--enable-unsafe-webgpu'] } }),
+      provider: playwright({ launchOptions: { channel: 'chromium', args: browserArgs } }),
       instances: [{ browser: 'chromium' }],
     },
   },
@@ -239,6 +288,7 @@ export default defineConfig({
     ...process.env,
     VITE_LFM3_QUALIFICATION_MODE: qualificationMode,
     ...(modelUrl ? { VITE_LFM3_MODEL_URL: modelUrl } : {}),
+    ...(audioProjectorUrl ? { VITE_LFM3_PROJECTOR_URL: audioProjectorUrl } : {}),
     ...(tokenizerUrl
       ? { VITE_LFM3_TOKENIZER_URL: tokenizerUrl }
       : {
@@ -254,6 +304,17 @@ export default defineConfig({
             ? { VITE_LFM3_LIQUID_AUDIO_INPUT_BASE_URL: liquidAudioInputBaseUrl }
             : {}),
           ...(liquidAudioOutputDirectory ? { VITE_LFM3_LIQUID_AUDIO_CAPTURE: '1' } : {}),
+          ...(nativeAudioInputFile
+            ? { VITE_LFM3_NATIVE_SPEECH_URL: '/__native-audio-input/native-speech-depth-3.wav' }
+            : {}),
+        }
+      : {}),
+    ...(qualificationMode === 'audio'
+      ? {
+          ...(nativeAudioInputBaseUrl
+            ? { VITE_LFM3_AUDIO_INPUT_BASE_URL: nativeAudioInputBaseUrl }
+            : {}),
+          ...(nativeAudioOutputDirectory ? { VITE_LFM3_NATIVE_AUDIO_CAPTURE: '1' } : {}),
         }
       : {}),
     ...(liquidReferenceOutput ? { VITE_LFM3_LIQUID_REFERENCE_CAPTURE: '1' } : {}),
@@ -264,6 +325,12 @@ export default defineConfig({
     '--config',
     join(consumerDirectory, 'vitest.config.ts'),
   ];
+  const modeTestFile =
+    qualificationMode === 'audio'
+      ? 'test/zoo/lfm3/public-audio.gpu.test.ts'
+      : qualificationMode === 'liquid-reference'
+        ? 'test/zoo/lfm3/liquid-reference.gpu.test.ts'
+        : undefined;
   if (reportPath) {
     vitestArgs.push(
       '--reporter=verbose',
@@ -271,7 +338,7 @@ export default defineConfig({
       `--outputFile.json=${resolve(reportPath)}`,
     );
   }
-  if (packedTestFile) vitestArgs.push(packedTestFile);
+  if (packedTestFile ?? modeTestFile) vitestArgs.push(packedTestFile ?? modeTestFile);
   run(process.execPath, vitestArgs, consumerDirectory, env);
   if (liquidReferenceOutput) {
     const capturedFixture = join(temporaryDirectory, 'liquid-reference-fixture.json');
@@ -286,6 +353,16 @@ export default defineConfig({
     if (files.length === 0) throw new Error('Liquid speech audio capture is empty');
     for (const name of files) {
       copyFileSync(join(capturedAudio, name), join(resolve(liquidAudioOutputDirectory), name));
+    }
+  }
+  if (nativeAudioOutputDirectory) {
+    const capturedAudio = join(temporaryDirectory, 'native-audio');
+    if (!existsSync(capturedAudio)) throw new Error('native speech audio capture is empty');
+    mkdirSync(resolve(nativeAudioOutputDirectory), { recursive: true });
+    const files = readdirSync(capturedAudio).filter((name) => name.endsWith('.wav'));
+    if (files.length === 0) throw new Error('native speech audio capture contains no WAV files');
+    for (const name of files) {
+      copyFileSync(join(capturedAudio, name), join(resolve(nativeAudioOutputDirectory), name));
     }
   }
 } finally {

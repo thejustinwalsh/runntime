@@ -12,6 +12,9 @@ const EXPECTED_TOKENS = {
   '<|startoftext|>': 124_894,
   '<|im_start|>': 124_899,
   '<|im_end|>': 124_900,
+  '<|audio|>': 125_031,
+  '<|audio_out|>': 125_032,
+  '<|audio_start|>': 125_012,
   '<|text_end|>': 125_014,
 } as const;
 
@@ -24,6 +27,10 @@ export interface Lfm3Message {
 /** Tokenization and text chat-template operations used by LFM3 generation. */
 export interface Lfm3Tokenizer {
   readonly bosId: number;
+  readonly audioId: number;
+  readonly audioOutId: number;
+  readonly audioStartId: number;
+  readonly textEndId: number;
   readonly stopIds: ReadonlySet<number>;
   encodeChat(messages: readonly Lfm3Message[]): number[];
   decode(ids: readonly number[]): string;
@@ -57,6 +64,10 @@ export function createLfm3Tokenizer(json: unknown): Lfm3Tokenizer {
 
   return {
     bosId: ids.get('<|startoftext|>')!,
+    audioId: ids.get('<|audio|>')!,
+    audioOutId: ids.get('<|audio_out|>')!,
+    audioStartId: ids.get('<|audio_start|>')!,
+    textEndId: ids.get('<|text_end|>')!,
     stopIds,
     encodeChat(messages) {
       if (messages.length === 0) throw bad('a chat prompt needs at least one message');

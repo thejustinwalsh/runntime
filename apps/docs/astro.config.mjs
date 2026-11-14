@@ -179,7 +179,7 @@ export default defineConfig({
             // The splash landing page belongs to no topic.
             exclude: ['/'],
             // The generated index pages sit outside the sidebar groups.
-            topics: { zoo: ['/api/**'] },
+            topics: { zoo: ['/api/**', '/zoo/lfm3-audio'] },
           },
         ),
         // Run after the topics: they fill the placeholder groups under

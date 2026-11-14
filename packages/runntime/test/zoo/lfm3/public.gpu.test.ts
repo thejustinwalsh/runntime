@@ -1,10 +1,6 @@
 /** Opt-in real-WebGPU loading and streaming through the public zoo entry. */
 
 import { expect, it } from 'vitest';
-import { tensor } from '../../../src/core/gpu/buffers.ts';
-import { evalValues, toArray } from '../../../src/core/gpu/eval.ts';
-import { add } from '../../../src/core/graph/ops.ts';
-import { matrix } from '../../../src/core/graph/value.ts';
 import {
   createLfm3Chat,
   models,
@@ -64,7 +60,7 @@ function hostHeapBytes(): number | null {
 it.skipIf(MODE !== 'base' && MODE !== 'q4')(
   `loads the ${MODE === 'q4' ? 'published Q4_K_M GGUF' : 'original checkpoint'} and streams text through a packed public consumer`,
   async (ctx) => {
-    const { root, ex: sharedExecutor } = await gpu();
+    await gpu();
     const before = liveBuffers();
     const invalidSource: RangeSource = { read: async () => new Uint8Array(8) };
     const loadController = new AbortController();
@@ -103,25 +99,80 @@ it.skipIf(MODE !== 'base' && MODE !== 'q4')(
         return data;
       },
     };
+    const loadConfig = { ...MODEL_CONFIG, modelPath: source, tokenizerPath: TOKENIZER_URL };
+
+    const partialLoadBefore = liveBuffers();
+    const partialLoadController = new AbortController();
+    let partialLoadReachedWeights = false;
+    await expect(
+      createLfm3Chat(loadConfig, {
+        signal: partialLoadController.signal,
+        onProgress(_name, done) {
+          if (!partialLoadReachedWeights && done > 0) {
+            partialLoadReachedWeights = true;
+            partialLoadController.abort('qualification partial-load abort');
+          }
+        },
+      }),
+    ).rejects.toMatchObject({ code: 'LOAD_ABORTED' });
+    expect(partialLoadReachedWeights).toBe(true);
+    const partialLoadBuffers = [...liveBuffers()].filter(
+      (buffer) => !partialLoadBefore.has(buffer),
+    );
+    expect(
+      partialLoadBuffers.filter((buffer) => (buffer.usage & GPUBufferUsage.STORAGE) !== 0),
+    ).toEqual([]);
+
+    const warmUpBefore = liveBuffers();
+    const warmUpController = new AbortController();
+    let modelUploadComplete = false;
+    let abortedAtWarmUp = false;
+    const originalPushErrorScope = GPUDevice.prototype.pushErrorScope;
+    GPUDevice.prototype.pushErrorScope = function (
+      this: GPUDevice,
+      filter: Parameters<GPUDevice['pushErrorScope']>[0],
+    ): undefined {
+      const result = originalPushErrorScope.call(this, filter);
+      if (modelUploadComplete && filter === 'out-of-memory' && !warmUpController.signal.aborted) {
+        abortedAtWarmUp = true;
+        warmUpController.abort('qualification warm-up abort');
+      }
+      return result;
+    };
+    try {
+      await expect(
+        createLfm3Chat(loadConfig, {
+          signal: warmUpController.signal,
+          onProgress(_name, done, total) {
+            if (done === total) modelUploadComplete = true;
+          },
+        }),
+      ).rejects.toMatchObject({ code: 'LOAD_ABORTED' });
+    } finally {
+      GPUDevice.prototype.pushErrorScope = originalPushErrorScope;
+    }
+    expect(modelUploadComplete).toBe(true);
+    expect(abortedAtWarmUp).toBe(true);
+    const warmUpBuffers = [...liveBuffers()].filter((buffer) => !warmUpBefore.has(buffer));
+    expect(warmUpBuffers.filter((buffer) => (buffer.usage & GPUBufferUsage.STORAGE) !== 0)).toEqual(
+      [],
+    );
 
     let progressDone = 0;
     let progressTotal = 0;
     let peakGpuBytes = gpuBufferBytes();
     let peakJsHeapBytes = hostHeapBytes();
     const loadStarted = performance.now();
-    const session = await createLfm3Chat(
-      { ...MODEL_CONFIG, modelPath: source, tokenizerPath: TOKENIZER_URL },
-      {
-        cacheId: MODE === 'q4' ? 'lfm3-omni-q4km-public-3d29af2a' : 'lfm3-original-base-21d75123',
-        onProgress(_name, done, total) {
-          progressDone = done;
-          progressTotal = total;
-          peakGpuBytes = Math.max(peakGpuBytes, gpuBufferBytes());
-          const heap = hostHeapBytes();
-          if (heap !== null) peakJsHeapBytes = Math.max(peakJsHeapBytes ?? 0, heap);
-        },
+    const session = await createLfm3Chat(loadConfig, {
+      cacheId: MODE === 'q4' ? 'lfm3-omni-q4km-public-3d29af2a' : 'lfm3-original-base-21d75123',
+      onProgress(_name, done, total) {
+        progressDone = done;
+        progressTotal = total;
+        peakGpuBytes = Math.max(peakGpuBytes, gpuBufferBytes());
+        const heap = hostHeapBytes();
+        if (heap !== null) peakJsHeapBytes = Math.max(peakJsHeapBytes ?? 0, heap);
       },
-    );
+    });
     ctx.onTestFinished(() => session.dispose());
     const loadMs = performance.now() - loadStarted;
     const loadedGpuBytes = gpuBufferBytes();
@@ -177,13 +228,20 @@ it.skipIf(MODE !== 'base' && MODE !== 'q4')(
     expect(recovered.text.trim().length).toBeGreaterThan(0);
     await session.dispose();
 
-    const sharedInput = tensor(root, Float32Array.of(2, 4), matrix(1, 2));
-    const sharedOutput = add(sharedInput, 1);
-    evalValues([sharedOutput], sharedExecutor);
-    expect(await toArray(sharedOutput, sharedExecutor)).toEqual(Float32Array.of(3, 5));
-    sharedExecutor.releaseValues([sharedOutput]);
-    sharedExecutor.trim();
-    sharedInput.buffer.destroy();
+    const sharedSession = await createLfm3Chat(loadConfig, {
+      cacheId: MODE === 'q4' ? 'lfm3-omni-q4km-public-3d29af2a' : 'lfm3-original-base-21d75123',
+    });
+    ctx.onTestFinished(() => sharedSession.dispose());
+    const sharedGeneration = sharedSession.generate(
+      [{ role: 'user', content: 'Confirm the shared WebGPU executor remains usable.' }],
+      { maxNewTokens: 12 },
+    );
+    let sharedStream = '';
+    for await (const delta of sharedGeneration) sharedStream += delta;
+    const sharedResult = await sharedGeneration.result;
+    expect(sharedResult.text.trim()).toBeTruthy();
+    expect(sharedStream).toBe(sharedResult.text);
+    await sharedSession.dispose();
 
     const remainingBuffers = [...liveBuffers()].filter((buffer) => !before.has(buffer));
     const report = {
@@ -201,7 +259,17 @@ it.skipIf(MODE !== 'base' && MODE !== 'q4')(
       secondGenerationMs: +second.latencyMs.toFixed(2),
       firstText: first.text,
       secondText: second.text,
+      sharedExecutorSurvivalText: sharedResult.text,
       liquidReferenceAnswers: referenceAnswers,
+      partialLoadAbort: {
+        reachedWeightUpload: partialLoadReachedWeights,
+        storageBuffersAfterCleanup: 0,
+      },
+      warmUpAbort: {
+        modelUploadComplete,
+        abortedAtWarmUp,
+        storageBuffersAfterCleanup: 0,
+      },
       recoveredTextAfterCancellation: recovered.text,
       gpuBuffersAfterLoadBytes: loadedGpuBytes,
       peakGpuBuffersBytes: peakGpuBytes,

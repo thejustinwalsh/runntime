@@ -590,8 +590,33 @@ export class Lfm3CausalLM extends nn.Module<
     }
     const uploads = ownedUploads;
     const embedding = track(this.model.embed_tokens.forward(ids, root), uploads);
-    const result = this.model.forward(embedding, ids.length, position, previous, root, uploads);
-    const final = slice(result.hidden, 0, ids.length - 1, ids.length);
+    return this.forwardEmbeddings(embedding, root, previous, uploads);
+  }
+
+  /** Runs caller-composed text and modality embeddings through the shared LFM3 backbone. */
+  forwardEmbeddings(
+    embeddings: Value,
+    root: TgpuRoot,
+    previous?: Lfm3Cache,
+    ownedUploads: Value[] = [],
+  ): Lfm3ModelStep {
+    const [rows, width] = embeddings.shape.dims ?? [];
+    if (!rows || width !== LFM3.hidden) {
+      throw new RunntimeError(
+        'INVALID_ARGUMENT',
+        `LFM3 embeddings must have shape [tokens, ${LFM3.hidden}]`,
+      );
+    }
+    const position = previous?.position ?? 0;
+    if (position + rows > LFM3.maxContext) {
+      throw new RunntimeError(
+        'INVALID_ARGUMENT',
+        `LFM3 context exhausted: ${position + rows} > ${LFM3.maxContext}`,
+      );
+    }
+    const uploads = ownedUploads;
+    const result = this.model.forward(embeddings, rows, position, previous, root, uploads);
+    const final = slice(result.hidden, 0, rows - 1, rows);
     return {
       hidden: result.hidden,
       logits: this.lm_head.forward(final),

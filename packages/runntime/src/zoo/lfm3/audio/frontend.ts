@@ -25,7 +25,7 @@ interface FftPlan {
   readonly twiddleImag: Float64Array;
 }
 
-interface ComplexArray {
+export interface Lfm3ComplexArray {
   readonly real: Float64Array;
   readonly imag: Float64Array;
 }
@@ -63,10 +63,10 @@ function makeFftPlan(size: number): FftPlan {
   return { size, radix, subSize, child, twiddleReal, twiddleImag };
 }
 
-function fft(real: Float64Array, imag: Float64Array, plan: FftPlan): ComplexArray {
+function fft(real: Float64Array, imag: Float64Array, plan: FftPlan): Lfm3ComplexArray {
   if (plan.size === 1) return { real, imag };
   if (!plan.child) return directDft(real, imag, plan);
-  const parts: ComplexArray[] = [];
+  const parts: Lfm3ComplexArray[] = [];
   for (let r = 0; r < plan.radix; r++) {
     const partReal = new Float64Array(plan.subSize);
     const partImag = new Float64Array(plan.subSize);
@@ -95,7 +95,7 @@ function fft(real: Float64Array, imag: Float64Array, plan: FftPlan): ComplexArra
   return { real: outputReal, imag: outputImag };
 }
 
-function directDft(real: Float64Array, imag: Float64Array, plan: FftPlan): ComplexArray {
+function directDft(real: Float64Array, imag: Float64Array, plan: FftPlan): Lfm3ComplexArray {
   const outputReal = new Float64Array(plan.size);
   const outputImag = new Float64Array(plan.size);
   for (let k = 0; k < plan.size; k++) {
@@ -108,6 +108,22 @@ function directDft(real: Float64Array, imag: Float64Array, plan: FftPlan): Compl
     }
   }
   return { real: outputReal, imag: outputImag };
+}
+
+/** Inverse complex FFT with backward normalization, matching `torch.fft.ifft`. */
+export function lfm3InverseFft(real: Float64Array, imag: Float64Array): Lfm3ComplexArray {
+  if (real.length === 0 || real.length !== imag.length) {
+    throw new RunntimeError(
+      'INVALID_ARGUMENT',
+      'inverse FFT needs equal nonempty real and imaginary arrays',
+    );
+  }
+  const conjugate = Float64Array.from(imag, (value) => -value);
+  const transformed = fft(real, conjugate, makeFftPlan(real.length));
+  return {
+    real: Float64Array.from(transformed.real, (value) => value / real.length),
+    imag: Float64Array.from(transformed.imag, (value) => -value / real.length),
+  };
 }
 
 function periodicHannWindow(size: number): Float64Array {

@@ -5,6 +5,9 @@ const specialTokens = [
   ['<|startoftext|>', 124_894],
   ['<|im_start|>', 124_899],
   ['<|im_end|>', 124_900],
+  ['<|audio|>', 125_031],
+  ['<|audio_out|>', 125_032],
+  ['<|audio_start|>', 125_012],
   ['<|text_end|>', 125_014],
 ] as const;
 
@@ -43,10 +46,22 @@ describe('LFM3 tokenizer and chat template', () => {
       { role: 'user', content: 'Hello.' },
     ]);
     expect(tokenizer.bosId).toBe(124_894);
+    expect(tokenizer.audioId).toBe(125_031);
+    expect(tokenizer.audioOutId).toBe(125_032);
+    expect(tokenizer.audioStartId).toBe(125_012);
     expect(ids[0]).toBe(124_894);
     expect(ids.filter((id) => id === 124_899)).toHaveLength(3);
     expect(ids.filter((id) => id === 124_900)).toHaveLength(2);
     expect(tokenizer.stopIds).toEqual(new Set([124_900, 125_014]));
+  });
+
+  it('keeps an audio placeholder as one special token in the Liquid transcription prompt', () => {
+    const tokenizer = createLfm3Tokenizer(json);
+    const ids = tokenizer.encodeChat([
+      { role: 'user', content: 'Transcribe this audio: <|audio|>' },
+    ]);
+
+    expect(ids.filter((id) => id === tokenizer.audioId)).toHaveLength(1);
   });
 
   it('rejects a tokenizer whose pinned stop token has moved', () => {

@@ -1,6 +1,7 @@
 /** Generates teacher-forced vectors and deterministic answers with Liquid's pinned engine. */
 
 import { expect, it } from 'vitest';
+import { resampleAudio } from '../../../src/zoo/index.ts';
 
 interface Message {
   readonly role: 'user';
@@ -48,7 +49,7 @@ interface LiquidAudioStreamOptions {
 }
 
 interface LiquidSpeechCallback {
-  (audio: Float32Array): void;
+  readonly audio: (audio: Float32Array) => void;
   frame?(codes: Int32Array): void;
 }
 
@@ -96,6 +97,7 @@ declare global {
     readonly VITE_LFM3_LIQUID_PROJECTOR_URL?: string;
     readonly VITE_LFM3_LIQUID_AUDIO_INPUT_BASE_URL?: string;
     readonly VITE_LFM3_LIQUID_AUDIO_CAPTURE?: string;
+    readonly VITE_LFM3_NATIVE_SPEECH_URL?: string;
   }
   interface ImportMeta {
     readonly env: ImportMetaEnv;
@@ -108,6 +110,7 @@ const LIQUID_MODEL_URL = import.meta.env.VITE_LFM3_LIQUID_MODEL_URL;
 const LIQUID_PROJECTOR_URL = import.meta.env.VITE_LFM3_LIQUID_PROJECTOR_URL;
 const AUDIO_INPUT_BASE_URL = import.meta.env.VITE_LFM3_LIQUID_AUDIO_INPUT_BASE_URL;
 const AUDIO_CAPTURE = import.meta.env.VITE_LFM3_LIQUID_AUDIO_CAPTURE === '1';
+const NATIVE_SPEECH_URL = import.meta.env.VITE_LFM3_NATIVE_SPEECH_URL;
 const ENGINE_REVISION = '9c2fb176f4c222da394e8037d3c0d0837f70b978';
 const ENGINE_SHA256 = '77821949412f5dd6d60e37f22415f0e71454e65f6a73928529c6fbec0f2cf2cb';
 const GGUF_REVISION = '3d29af2ad166f8299c2d820937e47dc0add20ffc';
@@ -214,7 +217,10 @@ const AUDIO_CASES: readonly AudioReferenceCase[] = [
   },
 ];
 
-function decodePcm16Wav(data: ArrayBuffer): { samples: Float32Array; sampleRate: number } {
+function decodePcm16Wav(
+  data: ArrayBuffer,
+  expectedSampleRate = 16_000,
+): { samples: Float32Array; sampleRate: number } {
   const bytes = new Uint8Array(data);
   const view = new DataView(data);
   if (bytes.length < 44 || new TextDecoder().decode(bytes.subarray(0, 4)) !== 'RIFF') {
@@ -242,9 +248,9 @@ function decodePcm16Wav(data: ArrayBuffer): { samples: Float32Array; sampleRate:
     }
     offset = body + size + (size % 2);
   }
-  if (format !== 1 || channels !== 1 || bits !== 16 || sampleRate !== 16_000) {
+  if (format !== 1 || channels !== 1 || bits !== 16 || sampleRate !== expectedSampleRate) {
     throw new Error(
-      `WAV must be mono PCM16 at 16 kHz; got format=${format}, channels=${channels}, bits=${bits}, rate=${sampleRate}`,
+      `WAV must be mono PCM16 at ${expectedSampleRate} Hz; got format=${format}, channels=${channels}, bits=${bits}, rate=${sampleRate}`,
     );
   }
   if (dataOffset < 0 || dataBytes === 0 || dataBytes % 2 !== 0) {
@@ -378,10 +384,10 @@ async function captureAudioReferences(
       .trim();
     const audioChunks: Float32Array[] = [];
     let speechFrames = 0;
-    const onSpeech: LiquidSpeechCallback = Object.assign(
-      (chunk: Float32Array) => audioChunks.push(chunk),
-      { frame: () => speechFrames++ },
-    );
+    const onSpeech: LiquidSpeechCallback = {
+      audio: (chunk) => audioChunks.push(chunk),
+      frame: () => speechFrames++,
+    };
     const speech = await streamLiquidTokens(audioModel, reference, {
       prompt: `Say exactly: ${testCase.transcript}`,
       maxNewTokens: 256,
@@ -465,6 +471,45 @@ async function captureAudioReferences(
     });
   }
   return results;
+}
+
+async function captureNativeSpeechReference(
+  audioModel: LiquidAudioModel,
+  reference: LiquidReferenceModel,
+) {
+  if (!NATIVE_SPEECH_URL) throw new Error('the native speech WAV URL was not provided');
+  const response = await fetch(NATIVE_SPEECH_URL);
+  if (!response.ok) throw new Error(`failed to load native speech WAV: HTTP ${response.status}`);
+  const bytes = await response.arrayBuffer();
+  const { samples, sampleRate } = decodePcm16Wav(bytes, 24_000);
+  const transcriptionInput = await resampleAudio(samples, sampleRate);
+  const transcription = await streamLiquidTokens(audioModel, reference, {
+    samples: transcriptionInput,
+    prompt: '',
+    maxNewTokens: 128,
+  });
+  const text = reference.tokenizer
+    .decode(transcription.tokenIds, {
+      skip_special_tokens: true,
+      clean_up_tokenization_spaces: false,
+    })
+    .trim();
+  return {
+    sampleRate,
+    samples: samples.length,
+    bytes: bytes.byteLength,
+    sha256: await sha256(bytes),
+    transcriptionSampleRate: 16_000,
+    transcriptionSamples: transcriptionInput.length,
+    requestedText: AUDIO_CASES[0]!.transcript,
+    liquidTranscription: {
+      text,
+      normalizedText: normalizeWords(text),
+      matchesRequestedText: normalizeWords(text) === normalizeWords(AUDIO_CASES[0]!.transcript),
+      promptTokens: transcription.inputTokens,
+      generatedTokens: transcription.tokenIds.length,
+    },
+  };
 }
 
 async function teacherForcedVectors(
@@ -551,6 +596,10 @@ it.skipIf(MODE !== 'liquid-reference')(
     const audioFixtures = AUDIO_CAPTURE
       ? await captureAudioReferences(reference, model.audio_sampling_rate)
       : undefined;
+    const nativeSpeech =
+      AUDIO_CAPTURE && NATIVE_SPEECH_URL
+        ? await captureNativeSpeechReference(reference.model, reference)
+        : undefined;
     const report = {
       schemaVersion: 1,
       engine: { revision: ENGINE_REVISION, sha256: ENGINE_SHA256 },
@@ -567,6 +616,7 @@ it.skipIf(MODE !== 'liquid-reference')(
       },
       fixtures,
       ...(audioFixtures ? { audioFixtures } : {}),
+      ...(nativeSpeech ? { nativeSpeech } : {}),
     };
     const encoded = JSON.stringify(report);
     if (import.meta.env.VITE_LFM3_LIQUID_REFERENCE_CAPTURE === '1') {
@@ -577,6 +627,9 @@ it.skipIf(MODE !== 'liquid-reference')(
       });
       expect(response.status).toBe(204);
     }
+    if (nativeSpeech) {
+      console.info(`LFM3_LIQUID_NATIVE_SPEECH_REFERENCE ${JSON.stringify(nativeSpeech)}`);
+    }
     if (audioFixtures) {
       console.info(`LFM3_LIQUID_AUDIO_REFERENCE ${JSON.stringify(audioFixtures)}`);
       expect(audioFixtures).toHaveLength(AUDIO_CASES.length);
@@ -586,8 +639,15 @@ it.skipIf(MODE !== 'liquid-reference')(
         expect(fixture.liquidSpeech.sampleRate).toBe(24_000);
         expect(fixture.liquidSpeech.finiteNonempty).toBe(true);
         expect(fixture.liquidSpeech.speechFrames).toBeGreaterThan(0);
-        expect(fixture.speechTranscription.recoversRequestedText).toBe(true);
       }
+      expect(
+        audioFixtures.every((fixture) => fixture.speechTranscription.recoversRequestedText),
+        'pinned Liquid speech should recover the requested words through same-file transcription',
+      ).toBe(true);
+    }
+    if (nativeSpeech) {
+      expect(nativeSpeech.sampleRate).toBe(24_000);
+      expect(nativeSpeech.liquidTranscription.matchesRequestedText).toBe(true);
     }
     expect(fixtures).toHaveLength(CASES.length);
   },

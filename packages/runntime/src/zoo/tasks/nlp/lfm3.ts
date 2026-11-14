@@ -12,8 +12,10 @@ import {
   toArray,
   warmUp,
   type RangeSource,
+  type RunntimeExecutor,
   type Value,
 } from '../../../core/index.ts';
+import type { TgpuRoot } from 'typegpu';
 import { asLoadError, rethrowRunError } from '../../errors.ts';
 import {
   fetchJson,
@@ -24,13 +26,18 @@ import {
 } from '../../load.ts';
 import { models } from '../../models.ts';
 import { LFM3_Q4_K_M_SOURCE } from '../../lfm3/gguf.ts';
-import { cacheValues, Lfm3CausalLM, type Lfm3Cache } from '../../lfm3/model.ts';
+import { cacheValues, Lfm3CausalLM, type Lfm3Cache, type Lfm3ModelStep } from '../../lfm3/model.ts';
 import {
   createLfm3Session,
   type Lfm3ChatSession,
   type Lfm3SessionRuntime,
 } from '../../lfm3/session.ts';
-import { createLfm3Tokenizer, LFM3_REVISION, LFM3_TOKENIZER_URL } from '../../lfm3/tokenizer.ts';
+import {
+  createLfm3Tokenizer,
+  LFM3_REVISION,
+  LFM3_TOKENIZER_URL,
+  type Lfm3Tokenizer,
+} from '../../lfm3/tokenizer.ts';
 
 const MODEL_URL = `https://huggingface.co/LiquidAI/LFM3-Omni-2B/resolve/${LFM3_REVISION}/model.safetensors`;
 const GGUF_CACHE_PREFIX = 'lfm3-omni-q4km-v1';
@@ -52,11 +59,32 @@ export type {
 } from '../../lfm3/session.ts';
 export type { Lfm3Message } from '../../lfm3/tokenizer.ts';
 
-/** Loads the pinned original floating checkpoint and returns a streaming chat session. */
-export async function createLfm3Chat(
+/** Resources shared by public LFM3 language and audio runners. */
+export interface Lfm3Backbone {
+  readonly root: TgpuRoot;
+  readonly executor: RunntimeExecutor;
+  readonly model: Lfm3CausalLM;
+  readonly tokenizer: Lfm3Tokenizer;
+  readonly runtime: Lfm3SessionRuntime<Lfm3Cache>;
+  forwardEmbeddings(
+    embeddings: Value,
+    previous: Lfm3Cache | undefined,
+    signal: AbortSignal,
+    uploads: Value[],
+  ): Promise<{ logits: Float32Array; hidden: Float32Array; cache: Lfm3Cache }>;
+  forwardTokens(
+    ids: readonly number[],
+    previous: Lfm3Cache | undefined,
+    signal: AbortSignal,
+  ): Promise<{ logits: Float32Array; hidden: Float32Array; cache: Lfm3Cache }>;
+  embedTokens(ids: readonly number[], uploads: Value[]): Value;
+}
+
+/** Loads the pinned LFM3 language backbone for a composed task runner. */
+export async function loadLfm3Backbone(
   config: Lfm3ChatModel = models.lfm3.LFM3_OMNI_2B.DEFAULT,
   opts: LoadOptions = {},
-): Promise<Lfm3ChatSession> {
+): Promise<Lfm3Backbone> {
   const modelPath =
     config.modelPath ?? (config.format === 'gguf' ? LFM3_Q4_K_M_SOURCE.url : MODEL_URL);
   const tokenizerPath = config.tokenizerPath ?? LFM3_TOKENIZER_URL;
@@ -70,45 +98,76 @@ export async function createLfm3Chat(
       // Device loss rejects the wait; owned GPU buffers still need teardown.
     }
   };
-  const runtime: Lfm3SessionRuntime<Lfm3Cache> = {
-    async forward(ids: readonly number[], previous: Lfm3Cache | undefined, signal: AbortSignal) {
-      let step: ReturnType<Lfm3CausalLM['forward']> | undefined;
-      const uploads: Value[] = [];
-      try {
+  const runStep = async (
+    create: (uploads: Value[]) => Lfm3ModelStep,
+    previous: Lfm3Cache | undefined,
+    signal: AbortSignal,
+    uploads: Value[],
+    readHidden: boolean,
+  ): Promise<{ logits: Float32Array; hidden?: Float32Array; cache: Lfm3Cache }> => {
+    let step: Lfm3ModelStep | undefined;
+    try {
+      if (signal.aborted) {
+        throw new RunntimeError('EXECUTION_FAILED', 'LFM3 generation aborted', {
+          cause: signal.reason,
+        });
+      }
+      const result = await inGpuErrorScopes(root.device, 'LFM3 generation', async () => {
+        const current = create(uploads);
+        step = current;
+        evalValues(
+          [current.logits, ...(readHidden ? [current.hidden] : []), ...cacheValues(current.cache)],
+          executor,
+        );
+        const logitsPromise = toArray(current.logits, executor);
+        const hiddenPromise = readHidden ? toArray(current.hidden, executor) : undefined;
+        const [logits, hidden] = await Promise.all([logitsPromise, hiddenPromise]);
+        await releaseAfterWork();
         if (signal.aborted) {
           throw new RunntimeError('EXECUTION_FAILED', 'LFM3 generation aborted', {
             cause: signal.reason,
           });
         }
-        const result = await inGpuErrorScopes(root.device, 'LFM3 generation', async () => {
-          const current = model.forward(ids, root, previous, uploads);
-          step = current;
-          evalValues([current.logits, ...cacheValues(current.cache)], executor);
-          const logits = await toArray(current.logits, executor);
-          await releaseAfterWork();
-          if (signal.aborted) {
-            throw new RunntimeError('EXECUTION_FAILED', 'LFM3 generation aborted', {
-              cause: signal.reason,
-            });
-          }
-          if (
-            logits.length === 0 ||
-            !logits.every(Number.isFinite) ||
-            logits.every((value) => value === 0)
-          ) {
-            throw new RunntimeError('EXECUTION_FAILED', 'LFM3 generation produced unusable logits');
-          }
-          return { logits, step: current };
-        });
-        executor.releaseValues([result.step.logits]);
-        return { logits: result.logits, cache: result.step.cache };
-      } catch (error) {
-        await releaseAfterWork();
-        if (step) executor.releaseValues([step.logits, ...cacheValues(step.cache)]);
-        throw rethrowRunError(error);
-      } finally {
-        destroyUploads(uploads);
+        if (
+          logits.length === 0 ||
+          !logits.every(Number.isFinite) ||
+          logits.every((value) => value === 0) ||
+          (hidden && !hidden.every(Number.isFinite))
+        ) {
+          throw new RunntimeError('EXECUTION_FAILED', 'LFM3 generation produced unusable output');
+        }
+        return { logits, hidden, step: current };
+      });
+      executor.releaseValues([result.step.logits, ...(readHidden ? [result.step.hidden] : [])]);
+      const lastHidden = result.hidden?.slice(-2_048);
+      return {
+        logits: result.logits,
+        ...(lastHidden ? { hidden: lastHidden } : {}),
+        cache: result.step.cache,
+      };
+    } catch (error) {
+      await releaseAfterWork();
+      if (step) {
+        executor.releaseValues([
+          step.logits,
+          ...(readHidden ? [step.hidden] : []),
+          ...cacheValues(step.cache),
+        ]);
       }
+      throw rethrowRunError(error);
+    } finally {
+      destroyUploads(uploads);
+    }
+  };
+  const runtime: Lfm3SessionRuntime<Lfm3Cache> = {
+    async forward(ids: readonly number[], previous: Lfm3Cache | undefined, signal: AbortSignal) {
+      return runStep(
+        (uploads) => model.forward(ids, root, previous, uploads),
+        previous,
+        signal,
+        [],
+        false,
+      );
     },
     async release(cache: Lfm3Cache) {
       executor.releaseValues(cacheValues(cache));
@@ -126,7 +185,7 @@ export async function createLfm3Chat(
     },
   };
 
-  let tokenizer: ReturnType<typeof createLfm3Tokenizer> | undefined;
+  let tokenizer: Lfm3Tokenizer | undefined;
   try {
     throwIfAborted(opts.signal);
     const weights =
@@ -179,16 +238,63 @@ export async function createLfm3Chat(
       runtime.trim();
     }
 
-    return createLfm3Session(tokenizer, runtime);
+    return {
+      root,
+      executor,
+      model,
+      tokenizer,
+      runtime,
+      async forwardEmbeddings(embeddings, previous, signal, uploads) {
+        const result = await runStep(
+          (owned) => model.forwardEmbeddings(embeddings, root, previous, owned),
+          previous,
+          signal,
+          uploads,
+          true,
+        );
+        if (!result.hidden) {
+          throw new RunntimeError('EXECUTION_FAILED', 'LFM3 backbone returned no hidden state');
+        }
+        return { logits: result.logits, hidden: result.hidden, cache: result.cache };
+      },
+      async forwardTokens(ids, previous, signal) {
+        const result = await runStep(
+          (uploads) => model.forward(ids, root, previous, uploads),
+          previous,
+          signal,
+          [],
+          true,
+        );
+        if (!result.hidden) {
+          throw new RunntimeError('EXECUTION_FAILED', 'LFM3 backbone returned no hidden state');
+        }
+        return { logits: result.logits, hidden: result.hidden, cache: result.cache };
+      },
+      embedTokens(ids, uploads) {
+        const embeddings = model.model.embed_tokens.forward(ids, root);
+        uploads.push(embeddings);
+        return embeddings;
+      },
+    };
   } catch (error) {
     try {
       await runtime.dispose();
     } catch {
       // Preserve the actual load, tokenizer, abort or warm-up failure.
     }
+    throwIfAborted(opts.signal);
     if (isRunntimeError(error)) throw error;
     throw asLoadError(error, opts.signal);
   }
+}
+
+/** Loads the original floating checkpoint and returns a streaming chat session. */
+export async function createLfm3Chat(
+  config: Lfm3ChatModel = models.lfm3.LFM3_OMNI_2B.DEFAULT,
+  opts: LoadOptions = {},
+): Promise<Lfm3ChatSession> {
+  const loaded = await loadLfm3Backbone(config, opts);
+  return createLfm3Session(loaded.tokenizer, loaded.runtime);
 }
 
 async function openGgufWeights(modelPath: ModelPath, opts: LoadOptions) {
