@@ -30,12 +30,24 @@ import {
 } from '../../lfm3/audio/model.ts';
 import { LFM3 } from '../../lfm3/model.ts';
 import { LiquidCodecStream } from '../../lfm3/audio/codec.ts';
+import { encodeLfm3SpeechPrompt, encodeLfm3TranscriptionPrompt } from '../../lfm3/audio/prompts.ts';
 import {
   LFM3_AUDIO_MAX_SECONDS,
   LFM3_AUDIO_SAMPLE_RATE,
   lfm3AudioPaddedLength,
 } from '../../lfm3/audio/frontend.ts';
-import { validateLfm3AudioProjector } from '../../lfm3/audio/projector.ts';
+import {
+  validateLfm3AudioProjector,
+  type Lfm3AudioProjectorConfig,
+} from '../../lfm3/audio/projector.ts';
+import {
+  createLfm3DepthSampler,
+  lfm3MaskgitOrder,
+  lfm3MaskgitRevealSizes,
+  sampleLfm3DepthCode,
+  type Lfm3DepthSampler,
+  type Lfm3DepthSamplingSettings,
+} from '../../lfm3/audio/sampling.ts';
 import { LFM3_Q4_K_M_SOURCE, LFM3_Q8_0_PROJECTOR_SOURCE } from '../../lfm3/gguf.ts';
 import type { Lfm3Backbone, Lfm3ChatModel } from '../nlp/lfm3.ts';
 import { loadLfm3Backbone } from '../nlp/lfm3.ts';
@@ -102,10 +114,6 @@ const DEFAULT_TRANSCRIPTION_TOKENS = 256;
 const MAX_TRANSCRIPTION_TOKENS = 4_096;
 const DEFAULT_SPEECH_FRAMES = 256;
 const MAX_SPEECH_FRAMES = 1_024;
-const DEFAULT_TEMPERATURE = 0.4;
-const REPETITION_PENALTY = 1.2;
-const REPETITION_WINDOW = 64;
-const AUDIO_PLACEHOLDER = 'Transcribe this audio: <|audio|>';
 
 interface LinkedSignal {
   readonly signal: AbortSignal;
@@ -200,7 +208,7 @@ export async function createLfm3Audio(
     const liveBackbone = backbone;
     audioModel = new Lfm3OmniAudioModel();
     audioModel.half(root);
-    await audioModel.loadStateDict(projector, {
+    await audioModel.loadStateDict(projector.weights, {
       root,
       onProgress: (name, done, total) => {
         opts.onProgress?.(name, done, total);
@@ -210,6 +218,7 @@ export async function createLfm3Audio(
     throwIfAborted(opts.signal);
 
     const liveAudioModel = audioModel;
+    const depthSampling = projector.config.depthDecoder.sampling;
     const controllers = new Set<AbortController>();
     let queue: Promise<void> = Promise.resolve();
     let disposed = false;
@@ -257,9 +266,7 @@ export async function createLfm3Audio(
       validateAudio(audio);
       const uploads: Value[] = [];
       try {
-        const prompt = liveBackbone.tokenizer.encodeChat([
-          { role: 'user', content: AUDIO_PLACEHOLDER },
-        ]);
+        const prompt = encodeLfm3TranscriptionPrompt(liveBackbone.tokenizer);
         const positions = prompt.flatMap((token, index) =>
           token === liveBackbone.tokenizer.audioId ? [index] : [],
         );
@@ -434,10 +441,7 @@ export async function createLfm3Audio(
         await liveBackbone.runtime.release(transcriptionCache);
         transcriptionCache = undefined;
 
-        const speechPrompt = [
-          ...liveBackbone.tokenizer.encodeChat([{ role: 'user', content: 'Say exactly: Hello.' }]),
-          liveBackbone.tokenizer.audioStartId,
-        ];
+        const speechPrompt = encodeLfm3SpeechPrompt(liveBackbone.tokenizer, 'Hello.');
         const speech = await liveBackbone.forwardTokens(speechPrompt, undefined, warmSignal);
         speechCache = speech.cache;
         const logits = await depthLogits(
@@ -483,13 +487,10 @@ export async function createLfm3Audio(
       if (!text.trim())
         throw new RunntimeError('INVALID_ARGUMENT', 'speech text must not be empty');
       const maxAudioFrames = validateSpeechFrameLimit(options.maxAudioFrames);
-      const temperature = validateTemperature(options.temperature);
+      const temperature = validateTemperature(options.temperature, depthSampling.temperature);
       const depthPasses = validateDepthPasses(options.depthPasses);
-      const random = makeRandom(options.seed);
-      const messages = liveBackbone.tokenizer.encodeChat([
-        { role: 'user', content: `Say exactly: ${text}` },
-      ]);
-      const prompt = [...messages, liveBackbone.tokenizer.audioStartId];
+      const sampler = createLfm3DepthSampler(options.seed ?? randomSeed());
+      const prompt = encodeLfm3SpeechPrompt(liveBackbone.tokenizer, text);
       let languageCache: Awaited<ReturnType<Lfm3Backbone['forwardTokens']>>['cache'] | undefined;
       let codecCache: Lfm3AudioDecoderCache | undefined;
       let hidden: Float32Array | undefined;
@@ -508,9 +509,11 @@ export async function createLfm3Audio(
           const codes = await sampleAudioFrame(
             hidden,
             history,
+            frame,
             depthPasses,
             temperature,
-            random,
+            depthSampling,
+            sampler,
             depthLogits,
             signal,
           );
@@ -596,7 +599,7 @@ export async function createLfm3Audio(
         if (typeof text !== 'string' || !text.trim()) {
           throw new RunntimeError('INVALID_ARGUMENT', 'speech text must not be empty');
         }
-        validateSpeechOptions(options);
+        validateSpeechOptions(options, depthSampling);
         const linked = linkSignal(options.signal);
         const stream = new AudioQueue(() => linked.abort());
         const task = schedule(linked, () =>
@@ -654,23 +657,28 @@ async function openAudioProjector(path: ModelPath, opts: LoadOptions) {
   const source: RangeSource =
     typeof path === 'string' ? httpRangeSource(path, { onBytes: opts.onBytes }) : path;
   const index = await parseGgufHeader(source, LFM3_Q8_0_PROJECTOR_SOURCE.bytes);
-  validateLfm3AudioProjector(index);
+  const config: Lfm3AudioProjectorConfig = validateLfm3AudioProjector(index);
   throwIfAborted(opts.signal);
-  return fromGguf(source, {
-    fileBytes: LFM3_Q8_0_PROJECTOR_SOURCE.bytes,
-    sha256: LFM3_Q8_0_PROJECTOR_SOURCE.sha256,
-    cache: opts.cache,
-    cacheId: opts.cacheId ?? projectorCacheKey(path),
-    signal: opts.signal,
-  });
+  return {
+    weights: await fromGguf(source, {
+      fileBytes: LFM3_Q8_0_PROJECTOR_SOURCE.bytes,
+      sha256: LFM3_Q8_0_PROJECTOR_SOURCE.sha256,
+      cache: opts.cache,
+      cacheId: opts.cacheId ?? projectorCacheKey(path),
+      signal: opts.signal,
+    }),
+    config,
+  };
 }
 
 async function sampleAudioFrame(
   hidden: Float32Array,
   history: readonly number[][],
+  frame: number,
   passes: number,
   temperature: number,
-  random: () => number,
+  sampling: Lfm3DepthSamplingSettings,
+  sampler: Lfm3DepthSampler,
   forward: (
     hidden: Float32Array,
     codes: readonly number[],
@@ -679,19 +687,13 @@ async function sampleAudioFrame(
   ) => Promise<Float32Array[]>,
   signal: AbortSignal,
 ): Promise<number[]> {
-  const order = Array.from({ length: LFM3_AUDIO_CODEBOOKS }, (_, index) => index);
-  for (let index = order.length - 1; index > 0; index--) {
-    const swap = Math.floor(random() * (index + 1));
-    [order[index], order[swap]] = [order[swap]!, order[index]!];
-  }
+  const order = lfm3MaskgitOrder(LFM3_AUDIO_CODEBOOKS, sampler.nextRandom);
+  const revealSizes = lfm3MaskgitRevealSizes(LFM3_AUDIO_CODEBOOKS, passes);
   const codes = Array<number>(LFM3_AUDIO_CODEBOOKS).fill(0);
   const revealed = Array<boolean>(LFM3_AUDIO_CODEBOOKS).fill(false);
-  const previous = history.slice(-REPETITION_WINDOW);
+  const previous = sampling.repetitionWindow === 0 ? [] : history.slice(-sampling.repetitionWindow);
   let start = 0;
-  for (let pass = 0; pass < passes && start < order.length; pass++) {
-    const remaining = order.length - start;
-    const remainingPasses = passes - pass;
-    const count = Math.ceil(remaining / remainingPasses);
+  for (const count of revealSizes) {
     const selected = order.slice(start, start + count);
     const logits = await forward(
       hidden,
@@ -713,12 +715,16 @@ async function sampleAudioFrame(
           `LFM3 depth decoder returned ${values.length} logits for codebook ${book}`,
         );
       }
-      codes[book] = sampleCode(
-        values,
+      codes[book] = sampleLfm3DepthCode({
+        logits: values,
+        codebookSize: LFM3_AUDIO_CODEBOOK_SIZE,
+        codebook: book,
+        frame,
+        samplerSeed: sampler.seed,
         temperature,
-        random,
-        previous.map((frame) => frame[book]!),
-      );
+        repetitionPenalty: sampling.repetitionPenalty,
+        previousCodes: previous.map((previousFrame) => previousFrame[book]!),
+      });
       revealed[book] = true;
     }
     start += selected.length;
@@ -727,47 +733,6 @@ async function sampleAudioFrame(
     return Array<number>(LFM3_AUDIO_CODEBOOKS).fill(LFM3_AUDIO_EOS_CODE);
   }
   return codes;
-}
-
-function sampleCode(
-  logits: Float32Array,
-  temperature: number,
-  random: () => number,
-  previous: readonly number[],
-): number {
-  let maximum = -Infinity;
-  const adjusted = Float64Array.from(logits, (value, index) => {
-    if (!Number.isFinite(value)) {
-      throw new RunntimeError(
-        'EXECUTION_FAILED',
-        `LFM3 depth decoder produced non-finite logit ${index}`,
-      );
-    }
-    const penalized = previous.includes(index)
-      ? value < 0
-        ? value * REPETITION_PENALTY
-        : value / REPETITION_PENALTY
-      : value;
-    maximum = Math.max(maximum, penalized);
-    return penalized;
-  });
-  if (temperature === 0) {
-    let best = 0;
-    for (let index = 1; index < adjusted.length; index++) {
-      if (adjusted[index]! > adjusted[best]!) best = index;
-    }
-    return best;
-  }
-  let total = 0;
-  for (let index = 0; index < adjusted.length; index++) {
-    total += Math.exp((adjusted[index]! - maximum) / temperature);
-  }
-  let threshold = random() * total;
-  for (let index = 0; index < adjusted.length; index++) {
-    threshold -= Math.exp((adjusted[index]! - maximum) / temperature);
-    if (threshold <= 0) return index;
-  }
-  return adjusted.length - 1;
 }
 
 function argmax(values: Float32Array, limit = values.length): number {
@@ -786,17 +751,6 @@ function argmax(values: Float32Array, limit = values.length): number {
     if (value > values[best]!) best = index;
   }
   return best;
-}
-
-function makeRandom(seed?: number): () => number {
-  let state = seed ?? randomSeed();
-  return () => {
-    state = (state + 0x6d2b79f5) >>> 0;
-    let value = state;
-    value = Math.imul(value ^ (value >>> 15), value | 1);
-    value ^= value + Math.imul(value ^ (value >>> 7), value | 61);
-    return ((value ^ (value >>> 14)) >>> 0) / 4_294_967_296;
-  };
 }
 
 function randomSeed(): number {
@@ -847,8 +801,8 @@ function validateSpeechFrameLimit(value: number | undefined): number {
   return limit;
 }
 
-function validateTemperature(value: number | undefined): number {
-  const temperature = value ?? DEFAULT_TEMPERATURE;
+function validateTemperature(value: number | undefined, defaultTemperature: number): number {
+  const temperature = value ?? defaultTemperature;
   if (!Number.isFinite(temperature) || temperature < 0 || temperature > 2) {
     throw new RunntimeError('INVALID_ARGUMENT', 'temperature must be finite and in [0, 2]');
   }
@@ -866,9 +820,12 @@ function validateDepthPasses(value: number | undefined): number {
   return passes;
 }
 
-function validateSpeechOptions(options: Lfm3SpeechOptions): void {
+function validateSpeechOptions(
+  options: Lfm3SpeechOptions,
+  sampling: Lfm3DepthSamplingSettings,
+): void {
   validateSpeechFrameLimit(options.maxAudioFrames);
-  validateTemperature(options.temperature);
+  validateTemperature(options.temperature, sampling.temperature);
   validateDepthPasses(options.depthPasses);
   if (
     options.seed !== undefined &&

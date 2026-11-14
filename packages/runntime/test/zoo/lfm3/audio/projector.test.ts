@@ -91,6 +91,11 @@ it('returns the pinned encoder, depth-decoder and codec dimensions', () => {
       keyValueHeads: 8,
       codebooks: 12,
       codebookSize: 2_017,
+      sampling: {
+        temperature: 0.4,
+        repetitionPenalty: 1.2,
+        repetitionWindow: 64,
+      },
     },
     codec: { sampleRate: 24_000, hiddenSize: 512, layers: 8 },
   });
@@ -99,6 +104,8 @@ it('returns the pinned encoder, depth-decoder and codec dimensions', () => {
 it.each([
   { key: 'clip.audio.block_count', value: 16 },
   { key: 'clip.gen.audio.sampling.temp', value: 0 },
+  { key: 'clip.gen.audio.sampling.penalty_repeat', value: 1.1 },
+  { key: 'clip.gen.audio.sampling.penalty_last_n', value: 32 },
   { key: 'clip.has_gen_audio_encoder', value: false },
 ])('rejects mismatched projector metadata ($key)', ({ key, value }) => {
   expect(() => validateLfm3AudioProjector(projectorIndex({ metadata: { [key]: value } }))).toThrow(

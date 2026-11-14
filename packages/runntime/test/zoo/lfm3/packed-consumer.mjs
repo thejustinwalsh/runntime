@@ -115,6 +115,11 @@ try {
     'utf8',
   ).replace("from '../../../src/zoo/index.ts'", "from 'runntime/zoo'");
   writeFileSync(join(testDirectory, 'liquid-reference.gpu.test.ts'), referenceSource);
+  const audioReferenceSource = readFileSync(
+    join(packageDirectory, 'test/zoo/lfm3/audio-reference.gpu.test.ts'),
+    'utf8',
+  ).replaceAll("from '../../../src/", "from '@runntime-source/");
+  writeFileSync(join(testDirectory, 'audio-reference.gpu.test.ts'), audioReferenceSource);
   if (qualificationMode === 'liquid-reference') {
     if (!liquidEnginePath)
       throw new Error('set LFM3_LIQUID_ENGINE_PATH to the pinned Liquid engine bundle');
@@ -262,6 +267,7 @@ export default defineConfig({
       });
     },
   }],
+  resolve: { alias: [{ find: '@runntime-source', replacement: ${JSON.stringify(join(packageDirectory, 'src'))} }] },
   optimizeDeps: { include: ['typegpu'] },
   server: {
     fs: { allow: [${JSON.stringify(repositoryDirectory)}, ${JSON.stringify(temporaryDirectory)}] },

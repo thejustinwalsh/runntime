@@ -24,6 +24,11 @@ export interface Lfm3AudioProjectorConfig {
     readonly keyValueHeads: 8;
     readonly codebooks: 12;
     readonly codebookSize: 2_017;
+    readonly sampling: {
+      readonly temperature: number;
+      readonly repetitionPenalty: number;
+      readonly repetitionWindow: number;
+    };
   };
   readonly codec: {
     readonly sampleRate: 24_000;
@@ -60,6 +65,11 @@ const CONFIG: Lfm3AudioProjectorConfig = {
     keyValueHeads: 8,
     codebooks: 12,
     codebookSize: 2_017,
+    sampling: {
+      temperature: 0.4,
+      repetitionPenalty: 1.2,
+      repetitionWindow: 64,
+    },
   },
   codec: {
     sampleRate: 24_000,
@@ -216,9 +226,9 @@ export function validateLfm3AudioProjector(index: GgufIndex): Lfm3AudioProjector
     'clip.gen.audio.attention.head_count': CONFIG.depthDecoder.attentionHeads,
     'clip.gen.audio.attention.head_count_kv': CONFIG.depthDecoder.keyValueHeads,
     'clip.gen.audio.attention.layer_norm_epsilon': 1e-5,
-    'clip.gen.audio.sampling.temp': 0.4,
-    'clip.gen.audio.sampling.penalty_repeat': 1.2,
-    'clip.gen.audio.sampling.penalty_last_n': 64,
+    'clip.gen.audio.sampling.temp': CONFIG.depthDecoder.sampling.temperature,
+    'clip.gen.audio.sampling.penalty_repeat': CONFIG.depthDecoder.sampling.repetitionPenalty,
+    'clip.gen.audio.sampling.penalty_last_n': CONFIG.depthDecoder.sampling.repetitionWindow,
   };
   for (const [key, expected] of Object.entries(numbers)) {
     const actual = metadata[key];

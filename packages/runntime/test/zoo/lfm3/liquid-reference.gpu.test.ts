@@ -4,7 +4,7 @@ import { expect, it } from 'vitest';
 import { resampleAudio } from '../../../src/zoo/index.ts';
 
 interface Message {
-  readonly role: 'user';
+  readonly role: 'system' | 'user';
   readonly content: string;
 }
 
@@ -45,6 +45,8 @@ interface LiquidAudioStreamOptions {
   readonly seed?: number;
   readonly depth_decoder_do_sample?: boolean;
   readonly depth_decoder_temperature?: number;
+  readonly depth_decoder_repetition_penalty?: number;
+  readonly depth_decoder_repetition_window?: number;
   readonly on_speech?: LiquidSpeechCallback;
 }
 
@@ -62,7 +64,7 @@ interface LiquidAudioModel {
 interface LiquidReferenceModel {
   readonly model: {
     readonly language_model: LiquidLanguageModel;
-    readonly tokens: { readonly audio: number };
+    readonly tokens: { readonly audio: number; readonly audioStart: number };
     planAudio: LiquidAudioModel['planAudio'];
     streamTokenIds: LiquidAudioModel['streamTokenIds'];
   };
@@ -116,6 +118,9 @@ const NATIVE_SPEECH_URL = import.meta.env.VITE_LFM3_NATIVE_SPEECH_URL;
 const ENGINE_REVISION = '9c2fb176f4c222da394e8037d3c0d0837f70b978';
 const ENGINE_SHA256 = '77821949412f5dd6d60e37f22415f0e71454e65f6a73928529c6fbec0f2cf2cb';
 const GGUF_REVISION = '3d29af2ad166f8299c2d820937e47dc0add20ffc';
+const ASR_SYSTEM_PROMPT = 'Perform ASR in English.';
+const TTS_SYSTEM_PROMPT = 'Perform TTS in American English using a female voice.';
+const AUDIO_PLACEHOLDER = '<|audio|>';
 const GGUF_URL =
   LIQUID_MODEL_URL ??
   `https://huggingface.co/LiquidAI/LFM3-Omni-2B-GGUF/resolve/${GGUF_REVISION}/LFM3-Omni-2B-Q4_K_M.gguf`;
@@ -191,7 +196,11 @@ interface AudioReferenceResult {
     readonly bytes: number;
     readonly sha256: string;
     readonly seed: number;
+    readonly promptTokenIds: readonly number[];
     readonly depthDecoderTemperature: number;
+    readonly depthDecoderRepetitionPenalty: number;
+    readonly depthDecoderRepetitionWindow: number;
+    readonly maskgitRevealSchedule: readonly number[];
     readonly speechFrames: number;
     readonly streamChunks: number;
     readonly generatedTokens: number;
@@ -328,9 +337,10 @@ function encodeFloat32Wav(samples: Float32Array, sampleRate: number): ArrayBuffe
 }
 
 function audioPromptIds(reference: LiquidReferenceModel, placeholderCount: number): number[] {
-  const placeholders = '<|audio|>'.repeat(placeholderCount);
-  const prompt = `<|startoftext|><|im_start|>user\nTranscribe this audio: ${placeholders}<|im_end|>\n<|im_start|>assistant\n<think></think>`;
-  const ids = reference.tokenizer.encode(prompt, { add_special_tokens: false }).ids;
+  const ids = reference.encodePrompt([
+    { role: 'system', content: ASR_SYSTEM_PROMPT },
+    { role: 'user', content: AUDIO_PLACEHOLDER.repeat(placeholderCount) },
+  ]);
   const audioId = reference.model.tokens.audio;
   const audioPositions = ids.flatMap((id, index) => (id === audioId ? [index] : []));
   if (audioPositions.length !== placeholderCount) {
@@ -346,12 +356,15 @@ async function streamLiquidTokens(
   reference: LiquidReferenceModel,
   input: {
     readonly samples?: Float32Array;
-    readonly prompt: string;
+    readonly messages?: readonly Message[];
     readonly maxNewTokens: number;
     readonly seed?: number;
+    readonly depthDecoderTemperature?: number;
+    readonly depthDecoderRepetitionPenalty?: number;
+    readonly depthDecoderRepetitionWindow?: number;
     readonly onSpeech?: LiquidSpeechCallback;
   },
-): Promise<{ tokenIds: number[]; inputTokens: number }> {
+): Promise<{ tokenIds: number[]; inputTokens: number; inputTokenIds: number[] }> {
   const audio = input.samples;
   let ids: number[];
   let audioInputs: readonly Float32Array[] | undefined;
@@ -363,22 +376,33 @@ async function streamLiquidTokens(
     }
     audioInputs = [audio];
   } else {
-    ids = reference.encodePrompt([{ role: 'user', content: input.prompt }]);
+    if (!input.messages) throw new Error('Liquid text input needs chat messages');
+    ids = reference.encodePrompt(input.messages);
   }
+  const inputTokenIds =
+    input.onSpeech && ids.at(-1) !== reference.model.tokens.audioStart
+      ? [...ids, reference.model.tokens.audioStart]
+      : ids;
   const tokenIds: number[] = [];
   for await (const token of model.streamTokenIds({
-    input_ids: [ids],
+    input_ids: [inputTokenIds],
     ...(audioInputs ? { audio: audioInputs } : {}),
     ...(input.onSpeech ? { generation_mode: 'audio' as const, on_speech: input.onSpeech } : {}),
     max_new_tokens: input.maxNewTokens,
     do_sample: false,
     ...(input.seed === undefined
       ? {}
-      : { seed: input.seed, depth_decoder_do_sample: true, depth_decoder_temperature: 0.4 }),
+      : {
+          seed: input.seed,
+          depth_decoder_do_sample: true,
+          depth_decoder_temperature: input.depthDecoderTemperature ?? 0.4,
+          depth_decoder_repetition_penalty: input.depthDecoderRepetitionPenalty ?? 1.2,
+          depth_decoder_repetition_window: input.depthDecoderRepetitionWindow ?? 64,
+        }),
   })) {
     tokenIds.push(token);
   }
-  return { tokenIds, inputTokens: ids.length };
+  return { tokenIds, inputTokens: inputTokenIds.length, inputTokenIds };
 }
 
 async function captureAudioReferences(
@@ -396,7 +420,6 @@ async function captureAudioReferences(
     const { samples, sampleRate } = decodePcm16Wav(inputBytes);
     const transcription = await streamLiquidTokens(audioModel, reference, {
       samples,
-      prompt: '',
       maxNewTokens: 128,
     });
     const transcript = reference.tokenizer
@@ -412,11 +435,21 @@ async function captureAudioReferences(
       frame: () => speechFrames++,
     };
     const speech = await streamLiquidTokens(audioModel, reference, {
-      prompt: `Say exactly: ${testCase.transcript}`,
+      messages: [
+        { role: 'system', content: TTS_SYSTEM_PROMPT },
+        { role: 'user', content: testCase.transcript },
+      ],
       maxNewTokens: 256,
       seed: 1234,
+      depthDecoderTemperature: 0.4,
+      depthDecoderRepetitionPenalty: 1.2,
+      depthDecoderRepetitionWindow: 64,
       onSpeech,
     });
+    const audioStartPositions = speech.inputTokenIds.flatMap((token, index) =>
+      token === reference.model.tokens.audioStart ? [index] : [],
+    );
+    expect(audioStartPositions).toEqual([speech.inputTokenIds.length - 1]);
     const totalSamples = audioChunks.reduce((sum, chunk) => sum + chunk.length, 0);
     const speechSamples = new Float32Array(totalSamples);
     let cursor = 0;
@@ -444,7 +477,6 @@ async function captureAudioReferences(
     const speechTranscriptionSamples = await resampleAudio(speechSamples, speechSampleRate);
     const speechTranscription = await streamLiquidTokens(audioModel, reference, {
       samples: speechTranscriptionSamples,
-      prompt: '',
       maxNewTokens: 128,
     });
     const speechTranscript = reference.tokenizer
@@ -463,7 +495,6 @@ async function captureAudioReferences(
           const samples = await resampleAudio(adjusted, speechSampleRate);
           const transcription = await streamLiquidTokens(audioModel, reference, {
             samples,
-            prompt: '',
             maxNewTokens: 128,
           });
           const text = reference.tokenizer
@@ -506,7 +537,11 @@ async function captureAudioReferences(
         bytes: speechBytes.byteLength,
         sha256: speechDigest,
         seed: 1234,
+        promptTokenIds: speech.inputTokenIds,
         depthDecoderTemperature: 0.4,
+        depthDecoderRepetitionPenalty: 1.2,
+        depthDecoderRepetitionWindow: 64,
+        maskgitRevealSchedule: [4, 4, 4],
         speechFrames,
         streamChunks: audioChunks.length,
         generatedTokens: speech.tokenIds.length,
@@ -540,7 +575,6 @@ async function captureNativeSpeechReference(
   const transcriptionInput = await resampleAudio(samples, sampleRate);
   const transcription = await streamLiquidTokens(audioModel, reference, {
     samples: transcriptionInput,
-    prompt: '',
     maxNewTokens: 128,
   });
   const text = reference.tokenizer
