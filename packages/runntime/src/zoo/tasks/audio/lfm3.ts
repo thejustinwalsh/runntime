@@ -617,6 +617,11 @@ export async function createLfm3Audio(
             },
           )
           .finally(linked.dispose);
+        // Stream-only and early-break consumers may never await `result`;
+        // hold an internal observer so a late rejection never surfaces as an
+        // unhandled rejection, mirroring the chat session. Awaiting `result`
+        // still observes the original outcome.
+        result.catch(() => undefined);
         return { result, cancel: () => linked.abort(), [Symbol.asyncIterator]: () => stream };
       },
       async dispose() {
