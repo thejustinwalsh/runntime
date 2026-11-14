@@ -304,6 +304,9 @@ export default defineConfig({
             ? { VITE_LFM3_LIQUID_AUDIO_INPUT_BASE_URL: liquidAudioInputBaseUrl }
             : {}),
           ...(liquidAudioOutputDirectory ? { VITE_LFM3_LIQUID_AUDIO_CAPTURE: '1' } : {}),
+          ...(process.env.LFM3_LIQUID_LEVEL_DIAGNOSTIC === '1'
+            ? { VITE_LFM3_LIQUID_LEVEL_DIAGNOSTIC: '1' }
+            : {}),
           ...(nativeAudioInputFile
             ? { VITE_LFM3_NATIVE_SPEECH_URL: '/__native-audio-input/native-speech-depth-3.wav' }
             : {}),

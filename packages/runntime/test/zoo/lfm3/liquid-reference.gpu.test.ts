@@ -97,6 +97,7 @@ declare global {
     readonly VITE_LFM3_LIQUID_PROJECTOR_URL?: string;
     readonly VITE_LFM3_LIQUID_AUDIO_INPUT_BASE_URL?: string;
     readonly VITE_LFM3_LIQUID_AUDIO_CAPTURE?: string;
+    readonly VITE_LFM3_LIQUID_LEVEL_DIAGNOSTIC?: string;
     readonly VITE_LFM3_NATIVE_SPEECH_URL?: string;
   }
   interface ImportMeta {
@@ -110,6 +111,7 @@ const LIQUID_MODEL_URL = import.meta.env.VITE_LFM3_LIQUID_MODEL_URL;
 const LIQUID_PROJECTOR_URL = import.meta.env.VITE_LFM3_LIQUID_PROJECTOR_URL;
 const AUDIO_INPUT_BASE_URL = import.meta.env.VITE_LFM3_LIQUID_AUDIO_INPUT_BASE_URL;
 const AUDIO_CAPTURE = import.meta.env.VITE_LFM3_LIQUID_AUDIO_CAPTURE === '1';
+const LEVEL_DIAGNOSTIC = import.meta.env.VITE_LFM3_LIQUID_LEVEL_DIAGNOSTIC === '1';
 const NATIVE_SPEECH_URL = import.meta.env.VITE_LFM3_NATIVE_SPEECH_URL;
 const ENGINE_REVISION = '9c2fb176f4c222da394e8037d3c0d0837f70b978';
 const ENGINE_SHA256 = '77821949412f5dd6d60e37f22415f0e71454e65f6a73928529c6fbec0f2cf2cb';
@@ -204,6 +206,13 @@ interface AudioReferenceResult {
     readonly generatedTokens: number;
     readonly recoversRequestedText: boolean;
   };
+  readonly levelDiagnostic?: {
+    readonly targetRms: number;
+    readonly gain: number;
+    readonly peak: number;
+    readonly text: string;
+    readonly normalizedText: string;
+  };
 }
 
 const AUDIO_CASES: readonly AudioReferenceCase[] = [
@@ -271,6 +280,18 @@ function normalizeWords(text: string): string {
     .replace(/[^\p{L}\p{N}]+/gu, ' ')
     .trim()
     .replace(/\s+/g, ' ');
+}
+
+function rms(samples: Float32Array): number {
+  let sum = 0;
+  for (const sample of samples) sum += sample * sample;
+  return Math.sqrt(sum / samples.length);
+}
+
+function peak(samples: Float32Array): number {
+  let maximum = 0;
+  for (const sample of samples) maximum = Math.max(maximum, Math.abs(sample));
+  return maximum;
 }
 
 async function sha256(data: ArrayBuffer): Promise<string> {
@@ -432,6 +453,34 @@ async function captureAudioReferences(
         clean_up_tokenization_spaces: false,
       })
       .trim();
+    const levelDiagnostic = LEVEL_DIAGNOSTIC
+      ? await (async () => {
+          // Diagnostic only: test whether low output level explains ASR failure.
+          // Acceptance continues to use the unmodified PCM above.
+          const targetRms = 0.1;
+          const gain = targetRms / rms(speechSamples);
+          const adjusted = Float32Array.from(speechSamples, (sample) => sample * gain);
+          const samples = await resampleAudio(adjusted, speechSampleRate);
+          const transcription = await streamLiquidTokens(audioModel, reference, {
+            samples,
+            prompt: '',
+            maxNewTokens: 128,
+          });
+          const text = reference.tokenizer
+            .decode(transcription.tokenIds, {
+              skip_special_tokens: true,
+              clean_up_tokenization_spaces: false,
+            })
+            .trim();
+          return {
+            targetRms,
+            gain,
+            peak: peak(adjusted),
+            text,
+            normalizedText: normalizeWords(text),
+          };
+        })()
+      : undefined;
     results.push({
       id: testCase.id,
       input: {
@@ -473,6 +522,7 @@ async function captureAudioReferences(
         recoversRequestedText:
           normalizeWords(speechTranscript) === normalizeWords(testCase.transcript),
       },
+      ...(levelDiagnostic ? { levelDiagnostic } : {}),
     });
   }
   return results;
