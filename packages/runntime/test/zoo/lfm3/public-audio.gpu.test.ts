@@ -1,7 +1,7 @@
 /** Opt-in public packed-consumer qualification for real LFM3 audio on WebGPU. */
 
 import { expect, it } from 'vitest';
-import { createLfm3Audio, decodeAudio, models, resampleAudio } from '../../../src/zoo/index.ts';
+import { createLfm3Omni, decodeAudio, models, resampleAudio } from '../../../src/zoo/index.ts';
 import { gpu, liveBuffers } from '../../gpu.ts';
 
 declare global {
@@ -118,7 +118,7 @@ it.skipIf(MODE !== 'audio')(
     let progressTotal = 0;
     let peakGpuBytes = gpuBufferBytes();
     const loadStarted = performance.now();
-    const audio = await createLfm3Audio(
+    const audio = await createLfm3Omni(
       {
         ...models.lfm3.LFM3_OMNI_2B.Q4_K_M,
         ...(import.meta.env.VITE_LFM3_MODEL_URL
@@ -143,6 +143,14 @@ it.skipIf(MODE !== 'audio')(
     const loadMs = performance.now() - loadStarted;
     const loadedGpuBytes = gpuBufferBytes();
     peakGpuBytes = Math.max(peakGpuBytes, loadedGpuBytes);
+
+    const text = audio.generate([{ role: 'user', content: 'Reply with one word: Hello' }], {
+      maxNewTokens: 16,
+    });
+    const reply = await text.result;
+    expect(reply.text).toMatch(/hello/i);
+    expect(reply.inputTokens).toBeGreaterThan(0);
+    peakGpuBytes = Math.max(peakGpuBytes, gpuBufferBytes());
 
     const fixtures = [];
     for (const input of INPUTS) {
