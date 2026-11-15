@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { fromGguf, parseGgufHeader } from '../../../src/core/weights/gguf.ts';
+import {
+  fromGguf,
+  parseGgufHeader,
+  readGgufEmbeddingRows,
+} from '../../../src/core/weights/gguf.ts';
 import type { RangeSource } from '../../../src/core/weights/safetensors.ts';
 import { Sha256 } from '../../../src/core/weights/sha256.ts';
 
@@ -281,4 +285,38 @@ describe('GGUF v3 weights', () => {
       fromGguf(source(bytes), { fileBytes: bytes.byteLength, sha256: '0'.repeat(64) }),
     ).rejects.toMatchObject({ code: 'CHECKPOINT_MISMATCH' });
   });
+});
+
+it('looks up repeated, out-of-order Q4 embedding rows without loading the table', async () => {
+  const block = q4Block();
+  const payload = new Uint8Array(3 * block.payload.length);
+  payload.set(block.payload, 0);
+  payload.set(block.payload, 2 * block.payload.length);
+  const file = fixture([{ name: 'embedding', dimensions: [256, 3], type: 12, payload }]);
+  const reads: Array<[number, number]> = [];
+  const input: RangeSource = {
+    async read(begin, end) {
+      reads.push([begin, end]);
+      return file.slice(begin, end);
+    },
+  };
+  const checkpoint = await fromGguf(input, { fileBytes: file.byteLength, sha256: sha256(file) });
+  const begin = (await parseGgufHeader(input, file.byteLength)).dataStart;
+  reads.length = 0;
+  const actual = await readGgufEmbeddingRows(
+    checkpoint,
+    'embedding',
+    256,
+    [2, 1, 2],
+    new AbortController().signal,
+  );
+  const expected = block.ints.map(
+    (q, i) => q * block.scales[Math.floor(i / 32)]! + block.offsets[Math.floor(i / 32)]!,
+  );
+  expect(Array.from(actual)).toEqual([...expected, ...Array(256).fill(0), ...expected]);
+  expect(reads).toEqual([
+    [begin + 288, begin + 432],
+    [begin + 144, begin + 288],
+  ]);
+  expect(() => checkpoint.rows('embedding', 3, 1)).toThrow('Invalid GGUF row range');
 });
