@@ -30,7 +30,11 @@ import {
 } from '../../lfm3/audio/model.ts';
 import { LFM3 } from '../../lfm3/model.ts';
 import { LiquidCodecStream } from '../../lfm3/audio/codec.ts';
-import { encodeLfm3SpeechPrompt, encodeLfm3TranscriptionPrompt } from '../../lfm3/audio/prompts.ts';
+import {
+  encodeLfm3SpeechPrompt,
+  encodeLfm3TranscriptionPrompt,
+  type Lfm3SpeechVoice,
+} from '../../lfm3/audio/prompts.ts';
 import {
   LFM3_AUDIO_MAX_SECONDS,
   LFM3_AUDIO_SAMPLE_RATE,
@@ -69,8 +73,14 @@ export interface Lfm3SpeechOptions {
   readonly depthPasses?: number;
   /** Reproducible codebook order and sampling when supplied. */
   readonly seed?: number;
+  /** Voice to speak with. Defaults to American English, female. */
+  readonly voice?: Lfm3SpeechVoice;
+  /** Complete TTS system instruction; overrides `voice` when supplied. */
+  readonly systemPrompt?: string;
   readonly signal?: AbortSignal;
 }
+
+export type { Lfm3SpeechVoice };
 
 /** Final samples and generation accounting for one speech response. */
 export interface Lfm3SpeechResult {
@@ -496,7 +506,7 @@ export async function createLfm3Audio(
       const temperature = validateTemperature(options.temperature, depthSampling.temperature);
       const depthPasses = validateDepthPasses(options.depthPasses);
       const sampler = createLfm3DepthSampler(options.seed ?? randomSeed());
-      const prompt = encodeLfm3SpeechPrompt(liveBackbone.tokenizer, text);
+      const prompt = encodeLfm3SpeechPrompt(liveBackbone.tokenizer, text, options);
       let languageCache: Awaited<ReturnType<Lfm3Backbone['forwardTokens']>>['cache'] | undefined;
       let codecCache: Lfm3AudioDecoderCache | undefined;
       let hidden: Float32Array | undefined;
@@ -861,11 +871,25 @@ function validateSpeechOptions(
   validateSpeechFrameLimit(options.maxAudioFrames);
   validateTemperature(options.temperature, sampling.temperature);
   validateDepthPasses(options.depthPasses);
+  validateSpeechVoice(options);
   if (
     options.seed !== undefined &&
     (!Number.isSafeInteger(options.seed) || options.seed < 0 || options.seed > 0xffff_ffff)
   ) {
     throw new RunntimeError('INVALID_ARGUMENT', 'seed must be an unsigned 32-bit integer');
+  }
+}
+
+function validateSpeechVoice(options: Lfm3SpeechOptions): void {
+  const { voice, systemPrompt } = options;
+  if (systemPrompt !== undefined && !systemPrompt.trim()) {
+    throw new RunntimeError('INVALID_ARGUMENT', 'systemPrompt must not be empty');
+  }
+  if (voice?.language !== undefined && !voice.language.trim()) {
+    throw new RunntimeError('INVALID_ARGUMENT', 'voice.language must not be empty');
+  }
+  if (voice?.gender !== undefined && voice.gender !== 'female' && voice.gender !== 'male') {
+    throw new RunntimeError('INVALID_ARGUMENT', 'voice.gender must be "female" or "male"');
   }
 }
 

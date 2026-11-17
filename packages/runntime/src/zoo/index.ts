@@ -63,6 +63,7 @@ export {
   type Lfm3SpeechGeneration,
   type Lfm3SpeechOptions,
   type Lfm3SpeechResult,
+  type Lfm3SpeechVoice,
   type Lfm3TranscriptionOptions,
 } from './tasks/audio/lfm3.ts';
 

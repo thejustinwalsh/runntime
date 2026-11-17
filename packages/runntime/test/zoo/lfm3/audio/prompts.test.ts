@@ -3,6 +3,7 @@ import { createLfm3Tokenizer } from '../../../../src/zoo/lfm3/tokenizer.ts';
 import {
   encodeLfm3SpeechPrompt,
   encodeLfm3TranscriptionPrompt,
+  lfm3SpeechSystemPrompt,
 } from '../../../../src/zoo/lfm3/audio/prompts.ts';
 
 const SPECIAL_TOKENS = [
@@ -15,6 +16,9 @@ const SPECIAL_TOKENS = [
   ['<|text_end|>', 125_014],
   ['Perform ASR in English.', 500],
   ['Perform TTS in American English using a female voice.', 501],
+  ['Perform TTS in British English using a female voice.', 507],
+  ['Perform TTS in American English using a male voice.', 508],
+  ['Speak slowly.', 509],
   ['The quick brown fox jumps over the lazy dog.', 502],
   ['<think></think>', 503],
   ['system\n', 504],
@@ -85,5 +89,47 @@ describe('LFM3 audio prompt framing', () => {
     expect(() => encodeLfm3SpeechPrompt(duplicated, 'Hello.')).toThrow(
       /misplaced audio-start token/,
     );
+  });
+
+  it('keeps the default prompt unchanged when no voice is selected', () => {
+    expect(lfm3SpeechSystemPrompt()).toBe('Perform TTS in American English using a female voice.');
+    expect(lfm3SpeechSystemPrompt({ voice: {} })).toBe(
+      'Perform TTS in American English using a female voice.',
+    );
+  });
+
+  it('builds the system instruction from a typed voice', () => {
+    expect(lfm3SpeechSystemPrompt({ voice: { language: 'British English' } })).toBe(
+      'Perform TTS in British English using a female voice.',
+    );
+    expect(lfm3SpeechSystemPrompt({ voice: { gender: 'male' } })).toBe(
+      'Perform TTS in American English using a male voice.',
+    );
+    const tokenizer = tokenizerFixture();
+    const text = 'The quick brown fox jumps over the lazy dog.';
+    expect(
+      encodeLfm3SpeechPrompt(tokenizer, text, {
+        voice: { language: 'British English', gender: 'female' },
+      }),
+    ).toEqual([
+      124_894, 124_899, 504, 507, 124_900, 124_899, 505, 502, 124_900, 124_899, 506, 503, 125_012,
+    ]);
+  });
+
+  it('lets an explicit systemPrompt override the voice', () => {
+    expect(
+      lfm3SpeechSystemPrompt({
+        voice: { language: 'British English' },
+        systemPrompt: 'Speak slowly.',
+      }),
+    ).toBe('Speak slowly.');
+    const tokenizer = tokenizerFixture();
+    expect(
+      encodeLfm3SpeechPrompt(tokenizer, 'The quick brown fox jumps over the lazy dog.', {
+        systemPrompt: 'Speak slowly.',
+      }),
+    ).toEqual([
+      124_894, 124_899, 504, 509, 124_900, 124_899, 505, 502, 124_900, 124_899, 506, 503, 125_012,
+    ]);
   });
 });
