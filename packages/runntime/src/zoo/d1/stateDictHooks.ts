@@ -4,7 +4,8 @@
 
 import { f16ToF32 } from '../../core/weights/convert.ts';
 import {
-  derivedTensor,
+  derive,
+  deriveFromTensors,
   type LazyStateDict,
   type LazyTensor,
   type QuantTensor,
@@ -41,19 +42,14 @@ function ropeRows(t: LazyTensor, scale = 1): LazyTensor {
     return head + (i % 2 === 0 ? i / 2 : half + (i - 1) / 2);
   };
   if (t.kind === 'quant') return quantRows(t, sourceRow);
-  return derivedTensor(
-    t.shape,
-    async () => {
-      const src = await t.f32();
-      const out = new Float32Array(src.length);
-      for (let r = 0; r < rows; r++) {
-        const from = sourceRow(r);
-        for (let c = 0; c < cols; c++) out[r * cols + c] = src[from * cols + c]! * scale;
-      }
-      return out;
-    },
-    t.byteLength,
-  );
+  return derive(t.shape, [t], ([src]) => {
+    const out = new Float32Array(src.length);
+    for (let r = 0; r < rows; r++) {
+      const from = sourceRow(r);
+      for (let c = 0; c < cols; c++) out[r * cols + c] = src[from * cols + c]! * scale;
+    }
+    return out;
+  });
 }
 
 /** Row-stacks torch-layout tensors, scaling the rows [0, scaledRows) of the
@@ -68,21 +64,17 @@ function stackRows(parts: LazyTensor[], scale = 1, scaledRows = 0): LazyTensor {
     }
     return stackQuantRows(quantized, scale, scaledRows);
   }
-  return derivedTensor(
-    cols === 1 ? [rows] : [rows, cols],
-    async () => {
-      const out = new Float32Array(rows * cols);
-      let base = 0;
-      for (const p of parts) {
-        const data = await p.f32();
-        out.set(data, base);
-        base += data.length;
-      }
-      for (let i = 0; i < scaledRows * cols; i++) out[i]! *= scale;
-      return out;
-    },
-    parts.reduce((s, p) => s + p.byteLength, 0),
-  );
+  return deriveFromTensors(cols === 1 ? [rows] : [rows, cols], parts, async () => {
+    const out = new Float32Array(rows * cols);
+    let base = 0;
+    for (const p of parts) {
+      const data = await p.f32();
+      out.set(data, base);
+      base += data.length;
+    }
+    for (let i = 0; i < scaledRows * cols; i++) out[i]! *= scale;
+    return out;
+  });
 }
 
 /** Scales the first `rows` rows of a torch-layout tensor. */
@@ -98,6 +90,7 @@ function quantRows(t: QuantTensor, sourceRow: (row: number) => number): QuantTen
     bits: t.bits,
     groupSize: t.groupSize,
     byteLength: t.byteLength,
+    sources: t.sources,
     async ints() {
       const source = await t.ints();
       const output = new Int8Array(source.length);
@@ -148,6 +141,7 @@ function stackQuantRows(parts: QuantTensor[], scale: number, scaledRows: number)
     bits: first.bits,
     groupSize: first.groupSize,
     byteLength: parts.reduce((sum, part) => sum + part.byteLength, 0),
+    sources: [...new Set(parts.flatMap((part) => part.sources))],
     async ints() {
       const source = await Promise.all(parts.map((part) => part.ints()));
       const output = new Int8Array(rows * cols);
@@ -186,8 +180,9 @@ function convTaps(sd: LazyStateDict, from: string, to: string): void {
   for (let k = 0; k < 3; k++) {
     sd.tensors.set(
       `${to}.tap${k}`,
-      derivedTensor(
+      deriveFromTensors(
         [HIDDEN],
+        [w],
         async () => {
           const src = await taps();
           return Float32Array.from({ length: HIDDEN }, (_, c) => src[c * 3 + k]!);
@@ -207,11 +202,8 @@ export function transformD1StateDict(sd: LazyStateDict, includeVision = true): v
   }
   const qScale = 1 / Math.sqrt(HEAD_DIM);
 
-  move(sd, 'encoder.embedding_norm.weight', 'encoder.embedding_norm.scale');
   [...LAYER_TYPES].forEach((kind, i) => {
     const p = `encoder.layers.${i}`;
-    move(sd, `${p}.operator_norm.weight`, `${p}.operator_norm.scale`);
-    move(sd, `${p}.ffn_norm.weight`, `${p}.ffn_norm.scale`);
     const w1 = take(sd, `${p}.feed_forward.w1.weight`);
     const w3 = take(sd, `${p}.feed_forward.w3.weight`);
     sd.tensors.set(`${p}.feed_forward.w13.weight`, stackRows([w3, w1]));
@@ -222,8 +214,11 @@ export function transformD1StateDict(sd: LazyStateDict, includeVision = true): v
     const a = `${p}.self_attn`;
     sd.tensors.set(`${a}.q_proj.weight`, ropeRows(take(sd, `${a}.q_proj.weight`)));
     sd.tensors.set(`${a}.k_proj.weight`, ropeRows(take(sd, `${a}.k_proj.weight`)));
-    sd.tensors.set(`${a}.q_layernorm.scale`, ropeRows(take(sd, `${a}.q_layernorm.weight`), qScale));
-    sd.tensors.set(`${a}.k_layernorm.scale`, ropeRows(take(sd, `${a}.k_layernorm.weight`)));
+    sd.tensors.set(
+      `${a}.q_layernorm.weight`,
+      ropeRows(take(sd, `${a}.q_layernorm.weight`), qScale),
+    );
+    sd.tensors.set(`${a}.k_layernorm.weight`, ropeRows(take(sd, `${a}.k_layernorm.weight`)));
   });
 
   for (let i = 0; i < HEAD_LAYERS; i++) {

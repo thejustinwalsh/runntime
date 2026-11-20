@@ -229,7 +229,7 @@ export const DEFAULT_CHUNK_BYTES = 8 * 1024 * 1024;
 
 /** Coalesces small reads into aligned `chunkBytes` windows, so a checkpoint
  *  costs about ceil(size/chunk) requests rather than one per tensor. Only the
- *  two most recent chunks are kept. `totalBytes` clamps the last one, which
+ *  four most recent chunks are kept. `totalBytes` clamps the last one, which
  *  would otherwise trip the short-body check. */
 export function chunkedSource(
   inner: RangeSource,
@@ -239,7 +239,7 @@ export function chunkedSource(
   const chunks = new Map<number, Promise<Uint8Array>>(); // insertion order = LRU order
   // A fold reads its conv weight and its norm params in one Promise.all, and
   // exporters often park the small tensors at the front of the file, so two
-  // windows let a pair like that evict each other every time.
+  // windows would let a pair like that evict each other every time.
   const KEEP = 4;
   const chunk = (i: number): Promise<Uint8Array> => {
     let p = chunks.get(i);
@@ -285,12 +285,26 @@ export function chunkedSource(
   };
 }
 
+/** A tensor of a checkpoint file, as the tensors read from it know it. */
+export interface FileSource {
+  /** Its name in the file. */
+  name: string;
+  /** Where it sits in the file: its byte offset, or its index in a
+   *  memoryStateDict. Only the order matters. */
+  position: number;
+  byteLength: number;
+}
+
 /** A tensor that may not be fetched or computed yet. File-backed ones carry
  *  the real dtype; derived ones report a nominal 'F32' and say what they
  *  hold through data(). */
 interface LazyTensorBase {
   shape: number[];
   byteLength: number;
+  /** The file tensors it is read from. Empty when it is read from none.
+   *  loadStateDict binds in the file order of the sources, so each chunk of
+   *  the file is fetched once. */
+  sources: readonly FileSource[];
   f32(): Promise<Float32Array>;
   halfWords(): Promise<Uint32Array>;
   /** U32 file tensors, or a derived Uint32Array. */
@@ -336,6 +350,9 @@ export interface QuantTensor extends LazyTensorBase {
 
 export type LazyTensor = FileTensor | DerivedTensor | QuantTensor;
 
+/** A tensor whose f32() gives its values: any but a QuantTensor. */
+export type FloatTensor = FileTensor | DerivedTensor;
+
 export interface LazyStateDict {
   metadata: Record<string, string>;
   /** Typed GGUF metadata is distinct from safetensors string metadata. */
@@ -376,6 +393,7 @@ function fileTensor(name: string, info: SafeTensorInfo, source: RangeSource): Fi
     dtype: info.dtype,
     shape: info.shape,
     byteLength: info.end - info.begin,
+    sources: [{ name, position: info.begin, byteLength: info.end - info.begin }],
     async f32() {
       const bytes = await fetchBytes();
       if (info.dtype === 'F32') return toF32(bytes);
@@ -413,12 +431,20 @@ function fileTensor(name: string, info: SafeTensorInfo, source: RangeSource): Fi
   };
 }
 
-/** A QuantTensor over `ints` and `scales`. Like derivedTensor it holds
+/** A QuantTensor over `ints` and `scales`. Like a derived tensor it holds
  *  nothing between reads. */
 export function quantTensor(
   parts: Pick<
     QuantTensor,
-    'name' | 'shape' | 'bits' | 'groupSize' | 'byteLength' | 'ints' | 'scales' | 'offsets'
+    | 'name'
+    | 'shape'
+    | 'bits'
+    | 'groupSize'
+    | 'byteLength'
+    | 'sources'
+    | 'ints'
+    | 'scales'
+    | 'offsets'
   >,
 ): QuantTensor {
   const refuse = () =>
@@ -428,7 +454,14 @@ export function quantTensor(
         `tensor ${parts.name} is quantized (int${parts.bits}, groups of ${parts.groupSize}) and has no float reading`,
       ),
     );
-  return { kind: 'quant', ...parts, f32: refuse, halfWords: refuse, words: refuse, u16: refuse };
+  return {
+    kind: 'quant',
+    ...parts,
+    f32: refuse,
+    halfWords: refuse,
+    words: refuse,
+    u16: refuse,
+  };
 }
 
 /** Unpacks int4 bytes, two values each with the low nibble first, into one
@@ -446,8 +479,9 @@ function unpackInt4(bytes: Uint8Array): Int8Array {
 
 /** The int weight `name` paired with its F16 `scale`, checked against the
  *  file's quantization setting. bits 8 needs I8; bits 4 needs U8, where U8
- *  means packed bytes of two signed nibbles, not unsigned values. Any other
- *  pairing throws CHECKPOINT_MISMATCH. */
+ *  means packed bytes of two signed nibbles, not unsigned values. A setting
+ *  without bits or groupSize takes them from the dtype and the scale's shape.
+ *  Any other pairing throws CHECKPOINT_MISMATCH. */
 function fileQuantTensor(
   name: string,
   info: SafeTensorInfo,
@@ -458,14 +492,22 @@ function fileQuantTensor(
   const bad = (why: string): never => {
     throw new RunntimeError('CHECKPOINT_MISMATCH', `safetensors: quantized tensor ${name} ${why}`);
   };
-  const { bits, groupSize } = quant;
+  const bits = quant.bits ?? (info.dtype === 'I8' ? 8 : 4);
   const dtype = bits === 8 ? 'I8' : 'U8';
   if (info.dtype !== dtype) bad(`is ${info.dtype}, but int${bits} is stored as ${dtype}`);
   if (info.shape.length !== 2) bad(`needs a 2D shape, got [${info.shape.join(', ')}]`);
   const out = info.shape[0]!;
   const cols = bits === 8 ? info.shape[1]! : info.shape[1]! * 2;
-  if (cols % groupSize !== 0) bad(`has ${cols} columns, not a multiple of groupSize ${groupSize}`);
   if (!scale) return bad(`has no ${name}_scale`);
+  const groups = scale.shape.length === 2 ? scale.shape[1]! : 0;
+  const groupSize = quant.groupSize ?? cols / groups;
+  if (!Number.isInteger(groupSize) || groupSize <= 0) {
+    bad(
+      `needs an F16 ${name}_scale [${out}, groups] with groups dividing ${cols}, ` +
+        `got ${scale.dtype} [${scale.shape.join(', ')}]`,
+    );
+  }
+  if (cols % groupSize !== 0) bad(`has ${cols} columns, not a multiple of groupSize ${groupSize}`);
   const scaleShape = [out, cols / groupSize];
   if (scale.dtype !== 'F16' || scale.shape.join() !== scaleShape.join()) {
     bad(
@@ -479,6 +521,7 @@ function fileQuantTensor(
     bits,
     groupSize,
     byteLength: info.end - info.begin + (scale.end - scale.begin),
+    sources: [{ name, position: info.begin, byteLength: info.end - info.begin }],
     async ints() {
       const bytes = await source.read(info.begin, info.end);
       if (bits === 4) return unpackInt4(bytes);
@@ -488,23 +531,57 @@ function fileQuantTensor(
   });
 }
 
-export function eagerTensor(data: Float32Array | Uint32Array, shape: number[]): LazyTensor {
-  return derivedTensor(shape, () => Promise.resolve(data), data.byteLength);
+export function eagerTensor(data: Float32Array | Uint32Array, shape: number[]): DerivedTensor {
+  return derive(shape, [], () => data, data.byteLength);
 }
 
-/** `byteLength` is this tensor's share of the download. A transform over
- *  several file tensors gives the sum to one output and 0 to the rest.
- *  Every read runs `compute` again: the tensor holds nothing between reads,
- *  so a load keeps only the tensor being bound in host memory. A transform
- *  with several outputs shares one read itself, like `splitRows`. */
-export function derivedTensor(
+/** What a derived tensor's compute returns: f32, f16 halfwords or packed u32
+ *  words. */
+type DerivedData = Float32Array | Uint16Array | Uint32Array;
+
+/** One f32 array per tensor of `T`. */
+type FloatsOf<T extends readonly FloatTensor[]> = { [K in keyof T]: Float32Array };
+
+/** A tensor that `compute` makes from the f32 values of `inputs`, which it
+ *  receives in the same order. A QuantTensor has no f32 values to give:
+ *  `floatTensor` checks an input is not one. For a compute that reads
+ *  halfwords or ints, or shares one read between outputs, see
+ *  `deriveFromTensors`, which also says what `byteLength` is. */
+export function derive<const T extends readonly FloatTensor[]>(
   shape: number[],
-  compute: () => Promise<Float32Array | Uint16Array | Uint32Array>,
-  byteLength = 0,
+  inputs: T,
+  compute: (floats: FloatsOf<T>) => DerivedData | Promise<DerivedData>,
+  byteLength?: number,
 ): DerivedTensor {
+  return deriveFromTensors(
+    shape,
+    inputs,
+    // Promise.all keeps the order and the length of `inputs`, which map()
+    // widens to an array.
+    async () => compute((await Promise.all(inputs.map((t) => t.f32()))) as FloatsOf<T>),
+    byteLength,
+  );
+}
+
+/** A tensor that `compute` makes from `inputs`, which it receives. Every
+ *  tensor `compute` reads must be in `inputs`: the result takes their
+ *  sources, and loadStateDict binds it where the file holds them.
+ *  `byteLength` is this tensor's share of the download, the inputs' sum by
+ *  default. A transform with several outputs gives the sum to one and 0 to
+ *  the rest. Every read runs `compute` again: the tensor holds nothing
+ *  between reads, so a load keeps only the tensor being bound in host
+ *  memory. A transform with several outputs shares one read itself, like
+ *  `splitRows`. */
+export function deriveFromTensors<const T extends readonly LazyTensor[]>(
+  shape: number[],
+  inputs: T,
+  compute: (inputs: T) => DerivedData | Promise<DerivedData>,
+  byteLength = inputs.reduce((sum, t) => sum + t.byteLength, 0),
+): DerivedTensor {
+  const read = async () => compute(inputs);
   /** Shared by halfWords() and words(); both want a Uint32Array back. */
   const asWords = async (): Promise<Uint32Array> => {
-    const data = await compute();
+    const data = await read();
     if (!(data instanceof Uint32Array))
       throw new Error('derived tensor holds f32 or halfwords, not words');
     return data;
@@ -514,11 +591,12 @@ export function derivedTensor(
     dtype: 'F32', // nominal only — see DerivedTensor
     shape,
     byteLength,
-    data: compute,
+    sources: [...new Set(inputs.flatMap((t) => t.sources))],
+    data: read,
     /** Halfwords decode, so an f16 transform still loads into an f32
      *  parameter or a hook that reads f32. */
     async f32() {
-      const data = await compute();
+      const data = await read();
       if (data instanceof Uint16Array) return f16ToF32(data);
       if (!(data instanceof Float32Array))
         throw new Error('derived tensor holds packed words, not f32');
@@ -528,7 +606,7 @@ export function derivedTensor(
     words: asWords,
     /** Lets a transform that already made f16 halfwords skip the f32 detour. */
     async u16(): Promise<Uint16Array> {
-      const data = await compute();
+      const data = await read();
       if (!(data instanceof Uint16Array)) throw new Error('derived tensor has no raw u16 bits');
       return data;
     },
@@ -552,10 +630,9 @@ export function memoryStateDict(entries: MemoryStateDict): LazyStateDict {
     const { data, shape } = ArrayBuffer.isView(entry)
       ? { data: entry, shape: [entry.length] }
       : entry;
-    tensors.set(
-      name,
-      data instanceof Uint16Array ? bf16Tensor(data, shape) : eagerTensor(data, shape),
-    );
+    const tensor = data instanceof Uint16Array ? bf16Tensor(data, shape) : eagerTensor(data, shape);
+    const source = { name, position: tensors.size, byteLength: tensor.byteLength };
+    tensors.set(name, { ...tensor, sources: [source] });
   }
   return {
     metadata: {},
@@ -564,9 +641,9 @@ export function memoryStateDict(entries: MemoryStateDict): LazyStateDict {
   };
 }
 
-/** In-memory bf16-bits tensor; f32() expands the bits into an f32's top
- *  half. */
-function bf16Tensor(bits: Uint16Array, shape: number[]): FileTensor {
+/** In-memory bf16-bits tensor, less the sources its caller gives it; f32()
+ *  expands the bits into an f32's top half. */
+function bf16Tensor(bits: Uint16Array, shape: number[]): Omit<FileTensor, 'sources'> {
   return {
     kind: 'file',
     dtype: 'BF16',
@@ -580,14 +657,17 @@ function bf16Tensor(bits: Uint16Array, shape: number[]): FileTensor {
 }
 
 /** Metadata key of a quantized file: a JSON string
- *  `{"version":1,"bits":8|4,"groupSize":N,"scheme":"symmetric"}`. */
+ *  `{"version":1,"bits":8|4,"groupSize":N,"scheme":"symmetric"}`. bits and
+ *  groupSize are optional: without them, each int weight's bits come from its
+ *  dtype and its groupSize from its scale's shape. */
 const QUANT_METADATA_KEY = 'runntime.quant';
 
 /** How a quantized file stores its int weights: `bits` per value, one f16
- *  scale per `groupSize` values along each row. */
+ *  scale per `groupSize` values along each row. A field the file leaves out
+ *  comes from each tensor. */
 interface QuantConfig {
-  bits: 4 | 8;
-  groupSize: number;
+  bits?: 4 | 8;
+  groupSize?: number;
 }
 
 /** The file's quantization setting, or undefined for a float file. Throws
@@ -613,8 +693,11 @@ function quantConfigOf(metadata: Record<string, string>): QuantConfig | undefine
   }
   const { version, bits, groupSize, scheme } = json as Record<string, unknown>;
   if (version !== 1) return bad('has a version other than 1');
-  if (bits !== 4 && bits !== 8) return bad('needs bits 4 or 8');
-  if (typeof groupSize !== 'number' || !Number.isSafeInteger(groupSize) || groupSize <= 0) {
+  if (bits !== undefined && bits !== 4 && bits !== 8) return bad('needs bits 4 or 8');
+  if (
+    groupSize !== undefined &&
+    (typeof groupSize !== 'number' || !Number.isSafeInteger(groupSize) || groupSize <= 0)
+  ) {
     return bad('needs a positive integer groupSize');
   }
   if (scheme !== 'symmetric') return bad("needs scheme 'symmetric'");

@@ -36,8 +36,13 @@ import {
 } from '../weights/convert.ts';
 import { foldBnIntoConv } from '../weights/foldBn.ts';
 import { packQuantW } from '../weights/quantPack.ts';
-import { derivedTensor, type LazyStateDict, type QuantTensor } from '../weights/safetensors.ts';
-import { readFloats, transposeWeight } from '../weights/transforms.ts';
+import {
+  derive,
+  deriveFromTensors,
+  type LazyStateDict,
+  type QuantTensor,
+} from '../weights/safetensors.ts';
+import { dequantize, floatTensor, readFloats, transposeWeight } from '../weights/transforms.ts';
 import { tensor } from '../gpu/buffers.ts';
 import { defaultRoot } from '../gpu/context.ts';
 import { CpuParameter, Module, Parameter, type AnyModule } from './module.ts';
@@ -46,7 +51,10 @@ import { CpuParameter, Module, Parameter, type AnyModule } from './module.ts';
  *
  *  On 'gpu' the weight doubles as a tied LM head, read through `weight.value`
  *  in its raw orientation. On 'cpu' it never reaches the GPU — forward()
- *  gathers the requested rows and uploads those — and tying is unavailable. */
+ *  gathers the requested rows and uploads those — and tying is unavailable.
+ *
+ *  A quantized checkpoint weight loads as its dequantized floats on 'gpu'; a
+ *  'cpu' table keeps it quantized and dequantizes the gathered rows. */
 export class Embedding extends Module<[readonly number[] | Value, TgpuRoot?], Value> {
   readonly weight: Parameter;
   constructor(
@@ -63,6 +71,13 @@ export class Embedding extends Module<[readonly number[] | Value, TgpuRoot?], Va
             dims: [numEmbeddings, embeddingDim],
           })
         : new Parameter(matrix(numEmbeddings, embeddingDim));
+  }
+  override transformStateDict(sd: LazyStateDict, prefix: string): void {
+    const name = prefix ? `${prefix}.weight` : 'weight';
+    const t = sd.tensors.get(name);
+    if (t?.kind === 'quant' && !(this.weight instanceof CpuParameter)) {
+      sd.tensors.set(name, dequantize(t));
+    }
   }
   /** CPU gather of the requested rows. cpu tables only. */
   gather(tokenIds: readonly number[]): Float32Array {
@@ -127,6 +142,66 @@ export class Embedding extends Module<[readonly number[] | Value, TgpuRoot?], Va
   }
 }
 
+/** Turns `weight` into quantW words [k, n], packed from `ints` with one row
+ *  of k per output, and puts its f32 scales right after it as
+ *  `<prefix>.weightScale`, so both bind in file order, then `offsets`, when
+ *  given, as `<prefix>.weightOffset`. The words carry t's whole download
+ *  size. Returns the scale parameter. */
+function loadQuantWeight(
+  sd: LazyStateDict,
+  prefix: string,
+  weight: Parameter,
+  t: QuantTensor,
+  shape: { k: number; n: number },
+  ints: () => Promise<Int8Array>,
+  scales: { dims: number[]; data: () => Promise<Float32Array> },
+  offsets?: { dims: number[]; data: () => Promise<Float32Array> },
+): Parameter {
+  const { k, n } = shape;
+  const at = (name: string) => (prefix ? `${prefix}.${name}` : name);
+  weight.retype('quantW', (k * n * t.bits) / 32, [k, n]);
+  const elems = scales.dims.reduce((a, b) => a * b, 1);
+  const scale = new Parameter({ elems, dtype: 'f32', dims: scales.dims }, undefined, true);
+  const words = deriveFromTensors([k, n], [t], async () => packQuantW(await ints(), k, n, t.bits));
+  const entries = [...sd.tensors];
+  sd.tensors.clear();
+  for (const [key, tensor] of entries) {
+    sd.tensors.set(key, key === at('weight') ? words : tensor);
+    if (key === at('weight')) {
+      sd.tensors.set(at('weightScale'), deriveFromTensors(scales.dims, [t], scales.data, 0));
+      if (offsets) {
+        sd.tensors.set(at('weightOffset'), deriveFromTensors(offsets.dims, [t], offsets.data, 0));
+      }
+    }
+  }
+  return scale;
+}
+
+/** `t`'s scales in f32, as stored. */
+async function scalesF32(t: QuantTensor): Promise<Float32Array> {
+  const data = await t.scales();
+  return data instanceof Float32Array ? data : f16ToF32(data);
+}
+
+/** torch's [out, groups] per-group values `f32` of `t` as the kernels'
+ *  [groups, n] in f32. Columns past out stay 0. */
+function groupColumns(t: QuantTensor, f32: Float32Array, groups: number, n: number): Float32Array {
+  const out = new Float32Array(groups * n);
+  for (let o = 0; o < t.shape[0]!; o++) {
+    for (let g = 0; g < groups; g++) out[g * n + o] = f32[o * groups + g]!;
+  }
+  return out;
+}
+
+async function scaleColumns(t: QuantTensor, groups: number, n: number): Promise<Float32Array> {
+  return groupColumns(t, await scalesF32(t), groups, n);
+}
+
+async function offsetColumns(t: QuantTensor, groups: number, n: number): Promise<Float32Array> {
+  const data = await t.offsets!();
+  return groupColumns(t, data instanceof Float32Array ? data : f16ToF32(data), groups, n);
+}
+
 /** y = x @ weight + bias. weight is stored [in, out]; torch checkpoints
  *  transpose once at load.
  *
@@ -163,7 +238,7 @@ export class Linear extends Module {
   override transformStateDict(sd: LazyStateDict, prefix: string): void {
     const name = prefix ? `${prefix}.weight` : 'weight';
     const tensor = sd.tensors.get(name);
-    if (!tensor) return; // missing keys are the strict check's job, not ours
+    if (!tensor) return; // missing keys are the key check's job, not ours
     // Without this a square wrong-layout weight loads silently transposed.
     if (
       tensor.shape.length !== 2 ||
@@ -182,9 +257,8 @@ export class Linear extends Module {
     }
     sd.tensors.set(name, transposeWeight(tensor));
   }
-  /** Replaces `name` with quantW words [in, out] and adds its scales
-   *  [in / groupSize, out] right after it, so they bind in file order. The
-   *  words carry the whole byteLength of the ints and scales. */
+  /** Loads `name` as quantW words [in, out] with its scales
+   *  [in / groupSize, out]. */
   private loadQuantized(
     sd: LazyStateDict,
     prefix: string,
@@ -205,57 +279,22 @@ export class Linear extends Module {
       );
     }
     this.quantization = { bits, groupSize };
-    this.weight.retype('quantW', (k * n * bits) / 32);
-    this.weightScale = new Parameter(
-      { elems: (k / groupSize) * n, dtype: 'f32', dims: [k / groupSize, n] },
-      undefined,
-      true,
-    );
-    const offsetData = tensor.offsets
-      ? derivedTensor([k / groupSize, n], async () => {
-          const data = await tensor.offsets!();
-          const f32 = data instanceof Float32Array ? data : f16ToF32(data);
-          const out = new Float32Array(f32.length);
-          for (let o = 0; o < n; o++) {
-            for (let g = 0; g < groups; g++) out[g * n + o] = f32[o * groups + g]!;
-          }
-          return out;
-        })
-      : undefined;
-    this.weightOffset = offsetData
-      ? new Parameter(
-          { elems: (k / groupSize) * n, dtype: 'f32', dims: [k / groupSize, n] },
-          undefined,
-          true,
-        )
-      : undefined;
-    const words = derivedTensor(
-      [k, n],
-      async () => packQuantW(await tensor.ints(), k, n, bits),
-      tensor.byteLength,
-    );
     const groups = k / groupSize;
-    const scales = derivedTensor([groups, n], async () => {
-      const data = await tensor.scales();
-      const f32 = data instanceof Float32Array ? data : f16ToF32(data);
-      // torch's [out, in / groupSize] to the kernels' [in / groupSize, out]
-      const out = new Float32Array(f32.length);
-      for (let o = 0; o < n; o++) {
-        for (let g = 0; g < groups; g++) out[g * n + o] = f32[o * groups + g]!;
-      }
-      return out;
-    });
-    const scaleName = prefix ? `${prefix}.weightScale` : 'weightScale';
-    const offsetName = prefix ? `${prefix}.weightOffset` : 'weightOffset';
-    const entries = [...sd.tensors];
-    sd.tensors.clear();
-    for (const [key, t] of entries) {
-      sd.tensors.set(key, key === name ? words : t);
-      if (key === name) {
-        sd.tensors.set(scaleName, scales);
-        if (offsetData) sd.tensors.set(offsetName, offsetData);
-      }
-    }
+    this.weightScale = loadQuantWeight(
+      sd,
+      prefix,
+      this.weight,
+      tensor,
+      { k, n },
+      () => tensor.ints(),
+      { dims: [groups, n], data: () => scaleColumns(tensor, groups, n) },
+      tensor.offsets
+        ? { dims: [groups, n], data: () => offsetColumns(tensor, groups, n) }
+        : undefined,
+    );
+    this.weightOffset = tensor.offsets
+      ? new Parameter({ elems: groups * n, dtype: 'f32', dims: [groups, n] }, undefined, true)
+      : undefined;
   }
   forward(x: Value, call: { addend?: Value } = {}): Value {
     if (!this.weightScale || !this.quantization) {
@@ -272,6 +311,28 @@ export class Linear extends Module {
   }
 }
 
+/** Throws CHECKPOINT_MISMATCH unless the quantized conv weight `t` is its
+ *  torch weight with the dims after the first flattened, [rows, cols]. */
+function checkQuantConvShape(
+  layer: string,
+  name: string,
+  t: QuantTensor,
+  { rows, cols, layout }: { rows: number; cols: number; layout: string },
+): void {
+  if (t.shape[0] !== rows || t.shape[1] !== cols) {
+    throw new RunntimeError(
+      'CHECKPOINT_MISMATCH',
+      `${layer}: ${name} is quantized as [${t.shape.join(', ')}], expected ${layout} = [${rows}, ${cols}]`,
+    );
+  }
+}
+
+/** Whether a conv over `taps` taps of cIn channels to n columns runs on the
+ *  quantized matmul. */
+function quantConvFits(cIn: number, taps: number, n: number): boolean {
+  return cIn % 4 === 0 && matmulQuantTiledEligible(taps * cIn, n);
+}
+
 /** Strided, dilated 1D convolution over time-major [T, inChannels]. No batch
  *  dim, no groups.
  *
@@ -279,10 +340,21 @@ export class Linear extends Module {
  *  each side independently instead. span − 1 on the left is causal, with
  *  span = dilation·(kernelSize − 1) + 1.
  *  weight is stored tap-major and permutes from torch layout at load. bias and
- *  `activation` fold into the conv epilogue. */
+ *  `activation` fold into the conv epilogue.
+ *
+ *  A quantized checkpoint weight is torch's [out, in·kernel], one scale per
+ *  group of values along each row. It loads as quantW words with its f32
+ *  scales in `weightScale` [in·kernel / groupSize, out]. Output channels pad
+ *  up to the packing width, scales and bias with them, and are cut after the
+ *  conv. A conv the quantized matmul cannot run loads a quantized weight as
+ *  its dequantized floats. */
 export class Conv1d extends Module {
   readonly weight: Parameter;
   readonly bias?: Parameter;
+  /** Set when a quantized weight loads. */
+  weightScale?: Parameter;
+  /** How the loaded weight is quantized, or undefined for a float weight. */
+  private quantization?: { bits: 4 | 8; groupSize: number };
   readonly stride: number;
   readonly dilation: number;
   readonly padding?: number | 'valid' | 'same';
@@ -319,8 +391,23 @@ export class Conv1d extends Module {
   }
   override transformStateDict(sd: LazyStateDict, prefix: string): void {
     const name = prefix ? `${prefix}.weight` : 'weight';
-    const tensor = sd.tensors.get(name);
-    if (!tensor) return; // a missing key is reported by the strict key check
+    let tensor = sd.tensors.get(name);
+    if (!tensor) return; // a missing key is reported by the key check
+    if (tensor.kind === 'quant') {
+      const { inChannels: cIn, outChannels: cOut, kernelSize: kernel } = this;
+      checkQuantConvShape('Conv1d', name, tensor, {
+        rows: cOut,
+        cols: cIn * kernel,
+        layout: '[out, in·kernel]',
+      });
+      const width = 32 / tensor.bits;
+      const n = Math.ceil(cOut / width) * width;
+      if (quantConvFits(cIn, kernel, n)) {
+        this.loadQuantized(sd, prefix, name, tensor, n);
+        return;
+      }
+      tensor = dequantize(tensor, [cOut, cIn, kernel]);
+    }
     // Without this a weight with equal in/out channels loads scrambled.
     if (
       tensor.shape.length !== 3 ||
@@ -336,21 +423,77 @@ export class Conv1d extends Module {
     }
     sd.tensors.set(
       name,
-      derivedTensor(
+      deriveFromTensors(
         [this.kernelSize * this.inChannels, this.outChannels],
-        async () =>
+        [tensor],
+        async ([torch]) =>
           convToTapMajor(
-            await readFloats('Conv1d', tensor),
+            await readFloats('Conv1d', torch),
             this.outChannels,
             this.inChannels,
             this.kernelSize,
           ),
-        tensor.byteLength,
       ),
     );
   }
+  /** Loads `name` as quantW words [kernel·in, n] with its scales
+   *  [in·kernel / groupSize, n], where n is outChannels padded to the packing
+   *  width. The bias pads to n too. */
+  private loadQuantized(
+    sd: LazyStateDict,
+    prefix: string,
+    name: string,
+    t: QuantTensor,
+    n: number,
+  ): void {
+    const { inChannels: cIn, outChannels: cOut, kernelSize: kernel } = this;
+    const k = kernel * cIn;
+    const groups = k / t.groupSize;
+    this.quantization = { bits: t.bits, groupSize: t.groupSize };
+    this.weightScale = loadQuantWeight(
+      sd,
+      prefix,
+      this.weight,
+      t,
+      { k, n },
+      async () => {
+        // torch's [out, in, kernel] to one tap-major row per output
+        const src = await t.ints();
+        const out = new Int8Array(n * k);
+        for (let o = 0; o < cOut; o++) {
+          for (let c = 0; c < cIn; c++) {
+            for (let tap = 0; tap < kernel; tap++) {
+              out[o * k + tap * cIn + c] = src[(o * cIn + c) * kernel + tap]!;
+            }
+          }
+        }
+        return out;
+      },
+      { dims: [groups, n], data: () => scaleColumns(t, groups, n) },
+    );
+    const biasName = prefix ? `${prefix}.bias` : 'bias';
+    const b = sd.tensors.get(biasName);
+    if (n > cOut && b && this.bias) {
+      if (b.shape.join() !== `${cOut}`) {
+        throw new RunntimeError(
+          'CHECKPOINT_MISMATCH',
+          `Conv1d: ${biasName} has shape ${JSON.stringify(b.shape)}, expected [${cOut}]`,
+        );
+      }
+      this.bias.retype(this.bias.shape.dtype, n, [n]);
+      sd.tensors.set(
+        biasName,
+        deriveFromTensors([n], [b], async ([b]) => {
+          const src = await readFloats('Conv1d', b);
+          const out = src instanceof Uint16Array ? new Uint16Array(n) : new Float32Array(n);
+          out.set(src);
+          return out;
+        }),
+      );
+    }
+  }
   forward(x: Value): Value {
-    return conv1d(x, this.weight.value, {
+    const y = conv1d(x, this.weight.value, {
       kernelSize: this.kernelSize,
       stride: this.stride,
       dilation: this.dilation,
@@ -359,7 +502,12 @@ export class Conv1d extends Module {
       padRight: this.padRight,
       bias: this.bias?.value,
       activation: this.activation,
+      ...(this.weightScale && this.quantization
+        ? { scales: this.weightScale.value, ...this.quantization }
+        : {}),
     });
+    const cols = this.weight.shape.dims![1]!;
+    return cols > this.outChannels ? slice(y, 1, 0, this.outChannels) : y;
   }
 }
 
@@ -369,10 +517,19 @@ export class Conv1d extends Module {
  *  Runs as a plain conv: kernelSize / stride taps to stride·outChannels
  *  channels. Each output row holds `stride` frames side by side, so a reshape
  *  unfolds them and a slice cuts the padding. The weight permutes from torch
- *  layout [in, out, kernel] at load, and the bias repeats per frame. */
+ *  layout [in, out, kernel] at load, and the bias repeats per frame.
+ *
+ *  A quantized checkpoint weight is torch's [in, out·kernel], one scale per
+ *  group of values along each row. It loads as quantW words with its f32
+ *  scales as stored in `weightScale`. A transposed conv the quantized matmul
+ *  cannot run loads a quantized weight as its dequantized floats. */
 export class ConvTranspose1d extends Module {
   readonly weight: Parameter;
   readonly bias?: Parameter;
+  /** Set when a quantized weight loads. */
+  weightScale?: Parameter;
+  /** How the loaded weight is quantized, or undefined for a float weight. */
+  private quantization?: { bits: 4 | 8; groupSize: number };
   readonly taps: number;
   readonly stride: number;
   readonly padding: number;
@@ -412,8 +569,21 @@ export class ConvTranspose1d extends Module {
   override transformStateDict(sd: LazyStateDict, prefix: string): void {
     const at = (n: string) => (prefix ? `${prefix}.${n}` : n);
     const { inChannels: cIn, outChannels: cOut, kernelSize: k, taps, stride: s } = this;
-    const w = sd.tensors.get(at('weight'));
-    if (w) {
+    let w = sd.tensors.get(at('weight'));
+    if (w?.kind === 'quant') {
+      checkQuantConvShape('ConvTranspose1d', at('weight'), w, {
+        rows: cIn,
+        cols: cOut * k,
+        layout: '[in, out·kernel]',
+      });
+      const n = s * cOut;
+      if (cOut % 4 === 0 && n % (32 / w.bits) === 0 && quantConvFits(cIn, taps, n)) {
+        this.loadQuantized(sd, prefix, w);
+      } else {
+        w = dequantize(w, [cIn, cOut, k]);
+      }
+    }
+    if (w && w.kind !== 'quant') {
       if (w.shape.length !== 3 || w.shape[0] !== cIn || w.shape[1] !== cOut || w.shape[2] !== k) {
         throw new RunntimeError(
           'CHECKPOINT_MISMATCH',
@@ -425,44 +595,69 @@ export class ConvTranspose1d extends Module {
       // that row uses kernel position (taps − 1 − i)·s + r.
       sd.tensors.set(
         at('weight'),
-        derivedTensor(
-          [taps * cIn, s * cOut],
-          async () => {
-            const src = await w.f32();
-            const out = new Float32Array(taps * cIn * s * cOut);
-            for (let i = 0; i < taps; i++) {
-              for (let c = 0; c < cIn; c++) {
-                const row = (i * cIn + c) * s * cOut;
-                for (let r = 0; r < s; r++) {
-                  const kk = (taps - 1 - i) * s + r;
-                  for (let o = 0; o < cOut; o++) {
-                    out[row + r * cOut + o] = src[(c * cOut + o) * k + kk]!;
-                  }
+        derive([taps * cIn, s * cOut], [w], ([src]) => {
+          const out = new Float32Array(taps * cIn * s * cOut);
+          for (let i = 0; i < taps; i++) {
+            for (let c = 0; c < cIn; c++) {
+              const row = (i * cIn + c) * s * cOut;
+              for (let r = 0; r < s; r++) {
+                const kk = (taps - 1 - i) * s + r;
+                for (let o = 0; o < cOut; o++) {
+                  out[row + r * cOut + o] = src[(c * cOut + o) * k + kk]!;
                 }
               }
             }
-            return out;
-          },
-          w.byteLength,
-        ),
+          }
+          return out;
+        }),
       );
     }
     const b = sd.tensors.get(at('bias'));
     if (b && this.bias) {
       sd.tensors.set(
         at('bias'),
-        derivedTensor(
-          [s * cOut],
-          async () => {
-            const src = await b.f32();
-            const out = new Float32Array(s * cOut);
-            for (let r = 0; r < s; r++) out.set(src, r * cOut);
-            return out;
-          },
-          b.byteLength,
-        ),
+        derive([s * cOut], [floatTensor('ConvTranspose1d', b)], ([src]) => {
+          const out = new Float32Array(s * cOut);
+          for (let r = 0; r < s; r++) out.set(src, r * cOut);
+          return out;
+        }),
       );
     }
+  }
+  /** Loads `t` as quantW words [taps·in, stride·out] with its scales
+   *  [in, out·kernel / groupSize] as stored. */
+  private loadQuantized(sd: LazyStateDict, prefix: string, t: QuantTensor): void {
+    const { inChannels: cIn, outChannels: cOut, kernelSize: kernel, taps, stride: s } = this;
+    const n = s * cOut;
+    const k = taps * cIn;
+    const cols = cOut * kernel;
+    this.quantization = { bits: t.bits, groupSize: t.groupSize };
+    const groups = cols / t.groupSize;
+    this.weightScale = loadQuantWeight(
+      sd,
+      prefix,
+      this.weight,
+      t,
+      { k, n },
+      async () => {
+        // Row i·in + c, column r·out + o takes kernel position
+        // (taps − 1 − i)·s + r.
+        const src = await t.ints();
+        const out = new Int8Array(n * k);
+        for (let r = 0; r < s; r++) {
+          for (let o = 0; o < cOut; o++) {
+            for (let i = 0; i < taps; i++) {
+              const kk = (taps - 1 - i) * s + r;
+              for (let c = 0; c < cIn; c++) {
+                out[(r * cOut + o) * k + i * cIn + c] = src[c * cols + o * kernel + kk]!;
+              }
+            }
+          }
+        }
+        return out;
+      },
+      { dims: [cIn, groups], data: () => scalesF32(t) },
+    );
   }
   forward(x: Value): Value {
     const { taps, stride: s, padding: p, outChannels } = this;
@@ -473,6 +668,13 @@ export class ConvTranspose1d extends Module {
       padLeft: taps - 1,
       padRight: taps - 1,
       bias: this.bias?.value,
+      ...(this.weightScale && this.quantization
+        ? {
+            scales: this.weightScale.value,
+            ...this.quantization,
+            transposedKernel: this.kernelSize,
+          }
+        : {}),
     });
     const rows = (t + taps - 1) * s;
     const frames = (t - 1) * s - 2 * p + this.kernelSize + this.outputPadding;
@@ -503,19 +705,14 @@ export class Snake extends Module {
     const c = this.channels;
     sd.tensors.set(
       at('weight'),
-      derivedTensor(
-        [2, c],
-        async () => {
-          const a = await alpha.f32();
-          const out = new Float32Array(2 * c);
-          for (let i = 0; i < c; i++) {
-            out[i] = a[i]!;
-            out[c + i] = 1 / (a[i]! + 1e-9);
-          }
-          return out;
-        },
-        alpha.byteLength,
-      ),
+      derive([2, c], [floatTensor('Snake', alpha)], ([a]) => {
+        const out = new Float32Array(2 * c);
+        for (let i = 0; i < c; i++) {
+          out[i] = a[i]!;
+          out[c + i] = 1 / (a[i]! + 1e-9);
+        }
+        return out;
+      }),
     );
   }
   forward(x: Value): Value {
@@ -721,16 +918,16 @@ export class BatchNorm2d extends Module {
 
 /** RMSNorm over the last dim of width `n`. */
 export class RMSNorm extends Module {
-  readonly scale: Parameter;
+  readonly weight: Parameter;
   constructor(
     readonly n: number,
     readonly eps = 1e-6,
   ) {
     super();
-    this.scale = new Parameter({ elems: n, dtype: 'f32', dims: [n] });
+    this.weight = new Parameter({ elems: n, dtype: 'f32', dims: [n] });
   }
   forward(x: Value): Value {
-    return rmsNorm(x, this.scale.value, this.eps);
+    return rmsNorm(x, this.weight.value, this.eps);
   }
 }
 

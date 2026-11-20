@@ -290,10 +290,10 @@ class Lfm3Attention extends nn.Module<
     slidingRope: { cos: Value; sin: Value },
   ): { output: Value; cache: Lfm3AttentionCache } {
     const layerType = LFM3.layerTypes[layer]!;
-    const q = rmsNorm(this.q_proj.forward(x), this.q_norm.scale.value, LFM3.eps, {
+    const q = rmsNorm(this.q_proj.forward(x), this.q_norm.weight.value, LFM3.eps, {
       group: LFM3.headDim,
     });
-    const k = rmsNorm(this.k_proj.forward(x), this.k_norm.scale.value, LFM3.eps, {
+    const k = rmsNorm(this.k_proj.forward(x), this.k_norm.weight.value, LFM3.eps, {
       group: LFM3.headDim,
     });
     const tables = layerType === 'full_attention' ? fullRope : slidingRope;
@@ -417,10 +417,10 @@ class Lfm3Layer extends nn.Module<
       op = result.output;
       convolution = result.cache;
     }
-    hidden = rmsNorm(op, this.post_operator_norm.scale.value, LFM3.eps, { residual });
+    hidden = rmsNorm(op, this.post_operator_norm.weight.value, LFM3.eps, { residual });
     const feedForward = rmsNorm(
       this.feed_forward.forward(this.ffn_norm.forward(hidden)),
-      this.post_ffn_norm.scale.value,
+      this.post_ffn_norm.weight.value,
       LFM3.eps,
       { residual: hidden },
     );
@@ -573,9 +573,6 @@ export class Lfm3CausalLM extends nn.Module<
     let embedding: LazyTensor | undefined;
     for (const [sourceName, sourceTensor] of language) {
       const name = sourceName.slice(prefix.length);
-      const targetName = /(?:^|\.)[a-z_]*norm\.weight$/.test(name)
-        ? name.replace(/\.weight$/, '.scale')
-        : name;
       let tensor = sourceTensor;
       if (name === 'embed_tokens.weight') {
         embedding = tensor;
@@ -589,7 +586,7 @@ export class Lfm3CausalLM extends nn.Module<
       ) {
         tensor = permuteRows(tensor, NORM_ORDER);
       }
-      sd.tensors.set(`model.${targetName}`, tensor);
+      sd.tensors.set(`model.${name}`, tensor);
     }
     for (let layer = 0; layer < LFM3.layers; layer++) {
       const w1 = sd.tensors.get(`model.layers.${layer}.feed_forward.w1.weight`);

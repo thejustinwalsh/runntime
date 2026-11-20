@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
-  derivedTensor,
+  deriveFromTensors,
   quantTensor,
   type LazyStateDict,
   type LazyTensor,
@@ -9,8 +9,9 @@ import { LFM3, Lfm3CausalLM } from '../../../src/zoo/lfm3/model.ts';
 
 function floats(shape: number[], value: (index: number) => number = () => 0): LazyTensor {
   const elems = shape.reduce((size, part) => size * part, 1);
-  return derivedTensor(
+  return deriveFromTensors(
     shape,
+    [],
     () => Promise.resolve(Float32Array.from({ length: elems }, (_, index) => value(index))),
     elems * 4,
   );
@@ -33,6 +34,7 @@ function qTensor(shape: number[], bits: 4 | 8, groupSize: number): LazyTensor {
     bits,
     groupSize,
     byteLength: (elems * bits) / 8,
+    sources: [],
     ints: () => Promise.resolve(new Int8Array(elems)),
     scales: () => Promise.resolve(new Float32Array(elems / groupSize)),
   });
@@ -88,12 +90,12 @@ describe('LFM3 checkpoint transforms', () => {
       'model.embed_tokens.weight',
       'model.layers.2.self_attn.q_proj.weight',
       'model.layers.2.self_attn.k_proj.weight',
-      'model.layers.2.self_attn.q_norm.scale',
-      'model.layers.2.self_attn.k_norm.scale',
+      'model.layers.2.self_attn.q_norm.weight',
+      'model.layers.2.self_attn.k_norm.weight',
       'lm_head.weight',
     ]);
     const q = await sd.tensors.get('model.layers.2.self_attn.q_proj.weight')!.f32();
-    const kNorm = await sd.tensors.get('model.layers.2.self_attn.k_norm.scale')!.f32();
+    const kNorm = await sd.tensors.get('model.layers.2.self_attn.k_norm.weight')!.f32();
     expect(Array.from(q.slice(0, 8 * LFM3.hidden).filter((_, i) => i % LFM3.hidden === 0))).toEqual(
       [0, 64, 1, 65, 2, 66, 3, 67],
     );
@@ -124,10 +126,10 @@ describe('LFM3 checkpoint transforms', () => {
     model.transformStateDict(sd);
     expect([...sd.tensors.keys()]).toEqual([
       'model.embed_tokens.weight',
-      'model.embedding_norm.scale',
+      'model.embedding_norm.weight',
       'model.layers.0.conv.conv.weight',
       'model.layers.2.self_attn.q_proj.weight',
-      'model.layers.2.self_attn.q_norm.scale',
+      'model.layers.2.self_attn.q_norm.weight',
       'lm_head.weight',
     ]);
     expect(sd.tensors.get('model.embed_tokens.weight')?.kind).toBe('quant');

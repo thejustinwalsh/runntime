@@ -146,6 +146,7 @@ export default defineConfig({
                   items: [
                     { label: 'Embedding', slug: 'zoo/embedding' },
                     { label: 'Speech to text', slug: 'zoo/speech-to-text' },
+                    { label: 'Text to speech', slug: 'zoo/text-to-speech' },
                     { label: 'Privacy filter', slug: 'zoo/privacy-filter' },
                     { label: 'D1 decision model', slug: 'zoo/d1' },
                     { label: 'LFM3 chat', slug: 'zoo/lfm3-chat' },
@@ -176,8 +177,9 @@ export default defineConfig({
             },
           ],
           {
-            // The splash landing page belongs to no topic.
-            exclude: ['/'],
+            // The splash landing page belongs to no topic, and the core pages stay
+            // unlisted until runntime core is published.
+            exclude: ['/', '/core/**'],
             // The generated index pages sit outside the sidebar groups.
             topics: { zoo: ['/api/**', '/zoo/lfm3-audio'] },
           },

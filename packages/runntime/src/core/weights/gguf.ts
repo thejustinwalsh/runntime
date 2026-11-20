@@ -7,8 +7,9 @@ import type { WeightCache } from './cache.ts';
 import { Sha256 } from './sha256.ts';
 import {
   chunkedSource,
-  derivedTensor,
+  deriveFromTensors,
   quantTensor,
+  type FileSource,
   type LazyStateDict,
   type RangeSource,
 } from './safetensors.ts';
@@ -387,6 +388,11 @@ function sharedTensorParts<T>(
   };
 }
 
+/** The file tensor `info` is read from, for the binding order. */
+function sourcesOf(info: GgufTensorInfo): FileSource[] {
+  return [{ name: info.name, position: info.begin, byteLength: info.end - info.begin }];
+}
+
 function q4Tensor(info: GgufTensorInfo, source: RangeSource): ReturnType<typeof quantTensor> {
   const elements = info.shape.reduce((product, dimension) => product * dimension, 1);
   const blocks = elements / QK_BLOCK;
@@ -432,6 +438,7 @@ function q4Tensor(info: GgufTensorInfo, source: RangeSource): ReturnType<typeof 
     bits: 4,
     groupSize: 32,
     byteLength: info.end - info.begin,
+    sources: sourcesOf(info),
     async ints() {
       return (await readPart(0)).ints;
     },
@@ -485,6 +492,7 @@ function q6Tensor(info: GgufTensorInfo, source: RangeSource): ReturnType<typeof 
     bits: 8,
     groupSize,
     byteLength: info.end - info.begin,
+    sources: sourcesOf(info),
     async ints() {
       return (await readPart(0)).ints;
     },
@@ -516,6 +524,7 @@ function q8_0Tensor(info: GgufTensorInfo, source: RangeSource): ReturnType<typeo
     bits: 8,
     groupSize: Q8_0_BLOCK,
     byteLength: info.end - info.begin,
+    sources: sourcesOf(info),
     async ints() {
       return (await readPart(0)).ints;
     },
@@ -529,26 +538,33 @@ function ggufTensor(info: GgufTensorInfo, source: RangeSource) {
   if (info.type === 'Q4_K') return q4Tensor(info, source);
   if (info.type === 'Q6_K') return q6Tensor(info, source);
   if (info.type === 'Q8_0') return q8_0Tensor(info, source);
-  return derivedTensor(
-    info.shape,
-    async () => {
-      const bytes = await source.read(info.begin, info.end);
-      if (bytes.byteLength !== info.end - info.begin) {
-        throw new RunntimeError('LOAD_FAILED', `GGUF tensor '${info.name}' returned a short read`);
-      }
-      if (info.type === 'F16') {
-        return f16ToF32(
-          new Uint16Array(
-            bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength),
-          ),
+  return {
+    ...deriveFromTensors(
+      info.shape,
+      [],
+      async () => {
+        const bytes = await source.read(info.begin, info.end);
+        if (bytes.byteLength !== info.end - info.begin) {
+          throw new RunntimeError(
+            'LOAD_FAILED',
+            `GGUF tensor '${info.name}' returned a short read`,
+          );
+        }
+        if (info.type === 'F16') {
+          return f16ToF32(
+            new Uint16Array(
+              bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength),
+            ),
+          );
+        }
+        return new Float32Array(
+          bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength),
         );
-      }
-      return new Float32Array(
-        bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength),
-      );
-    },
-    info.end - info.begin,
-  );
+      },
+      info.end - info.begin,
+    ),
+    sources: sourcesOf(info),
+  };
 }
 
 function abortIfNeeded(signal?: AbortSignal): void {

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
-  derivedTensor,
+  deriveFromTensors,
   quantTensor,
   type LazyStateDict,
   type LazyTensor,
@@ -14,7 +14,7 @@ const FFW = 4608;
 
 function floats(shape: number[]): LazyTensor {
   const elems = shape.reduce((size, part) => size * part, 1);
-  return derivedTensor(shape, () => Promise.resolve(new Float32Array(elems)), elems * 4);
+  return deriveFromTensors(shape, [], () => Promise.resolve(new Float32Array(elems)), elems * 4);
 }
 
 function quant(name: string, shape: [number, number], base: number): QuantTensor {
@@ -26,6 +26,7 @@ function quant(name: string, shape: [number, number], base: number): QuantTensor
     bits: 8,
     groupSize: 32,
     byteLength: rows * cols + rows * groups * 2,
+    sources: [],
     async ints() {
       const output = new Int8Array(rows * cols);
       for (let row = 0; row < rows; row++)

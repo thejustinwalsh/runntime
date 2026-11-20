@@ -4,7 +4,7 @@ import {
   add,
   cat,
   chunk,
-  derivedTensor,
+  deriveFromTensors,
   depthwiseConv1d,
   mul,
   nn,
@@ -719,7 +719,7 @@ function mapAudioTensor(name: string): string | undefined {
     const [, layer, suffix] = encoder;
     return `audioEncoder.lfm.layers.${layer}.${mapEncoderLayerSuffix(suffix!)}`;
   }
-  if (name === 'a.post_ln.weight') return 'audioEncoder.lfm.norm.scale';
+  if (name === 'a.post_ln.weight') return 'audioEncoder.lfm.norm.weight';
   if (name === 'mm.a.mlp.0.weight') return 'audioEncoder.projector.layerNorm.weight';
   if (name === 'mm.a.mlp.0.bias') return 'audioEncoder.projector.layerNorm.bias';
   if (name.startsWith('mm.a.mlp.1.'))
@@ -731,7 +731,7 @@ function mapAudioTensor(name: string): string | undefined {
   if (name === 'a.gen.code.proj_in.weight') return 'depthDecoder.projIn.weight';
   if (name === 'a.gen.code.proj_in.bias') return 'depthDecoder.projIn.bias';
   if (name === 'a.gen.code.mask_embd') return 'depthDecoder.maskEmbedding';
-  if (name === 'a.gen.code.output_norm.weight') return 'depthDecoder.model.norm.scale';
+  if (name === 'a.gen.code.output_norm.weight') return 'depthDecoder.model.norm.weight';
   if (name === 'a.gen.code.out_embd.weight') return 'audioOutputEmbedding.weight';
   if (name === 'a.gen.wav.quant.first.codebook.weight') return 'codec.codebook.weight';
   if (name.startsWith('a.gen.wav.quant.first.out_proj.')) {
@@ -743,7 +743,7 @@ function mapAudioTensor(name: string): string | undefined {
   if (name.startsWith('a.gen.wav.tfm.out_proj.')) {
     return `codec.outputProjection.${name.slice('a.gen.wav.tfm.out_proj.'.length)}`;
   }
-  if (name === 'a.gen.wav.tfm.output_norm.weight') return 'codec.model.norm.scale';
+  if (name === 'a.gen.wav.tfm.output_norm.weight') return 'codec.model.norm.weight';
   const codec = /^a\.gen\.wav\.tfm\.blk\.(\d+)\.(.+)$/.exec(name);
   if (codec) return `codec.model.layers.${codec[1]}.${mapCodecLayerSuffix(codec[2]!)}`;
   return undefined;
@@ -755,16 +755,16 @@ function mapEncoderLayerSuffix(suffix: string): string {
     'attn_k.weight': 'attention.kProj.weight',
     'attn_v.weight': 'attention.vProj.weight',
     'attn_out.weight': 'attention.outProj.weight',
-    'attn_q_norm.weight': 'attention.qNorm.scale',
-    'attn_k_norm.weight': 'attention.kNorm.scale',
+    'attn_q_norm.weight': 'attention.qNorm.weight',
+    'attn_k_norm.weight': 'attention.kNorm.weight',
     'conv_dw.weight': 'shortConv.depthwise',
     'conv_pw1.weight': 'shortConv.inProj.weight',
     'conv_pw2.weight': 'shortConv.outProj.weight',
     'ffn_gate.weight': 'ffn.gate.weight',
     'ffn_up.weight': 'ffn.up.weight',
     'ffn_down.weight': 'ffn.down.weight',
-    'ln1.weight': 'operatorNorm.scale',
-    'ln2.weight': 'ffnNorm.scale',
+    'ln1.weight': 'operatorNorm.weight',
+    'ln2.weight': 'ffnNorm.weight',
   };
   const mapped = projections[suffix];
   if (!mapped) throw new Error(`unrecognized LFM3 audio encoder tensor suffix '${suffix}'`);
@@ -778,13 +778,13 @@ function mapDepthLayerSuffix(suffix: string): string {
     'attn_k.weight': 'attention.kProj.weight',
     'attn_v.weight': 'attention.vProj.weight',
     'attn_out.weight': 'attention.outProj.weight',
-    'attn_q_norm.weight': 'attention.qNorm.scale',
-    'attn_k_norm.weight': 'attention.kNorm.scale',
+    'attn_q_norm.weight': 'attention.qNorm.weight',
+    'attn_k_norm.weight': 'attention.kNorm.weight',
     'ffn_gate.weight': 'ffn.gate.weight',
     'ffn_up.weight': 'ffn.up.weight',
     'ffn_down.weight': 'ffn.down.weight',
-    'ln1.weight': 'operatorNorm.scale',
-    'ln2.weight': 'ffnNorm.scale',
+    'ln1.weight': 'operatorNorm.weight',
+    'ln2.weight': 'ffnNorm.weight',
   };
   const mapped = projections[suffix];
   if (!mapped) throw new Error(`unrecognized LFM3 depth-decoder tensor suffix '${suffix}'`);
@@ -798,18 +798,18 @@ function mapCodecLayerSuffix(suffix: string): string {
     'attn_k.weight': 'attention.kProj.weight',
     'attn_v.weight': 'attention.vProj.weight',
     'attn_out.weight': 'attention.outProj.weight',
-    'attn_q_norm.weight': 'attention.qNorm.scale',
-    'attn_k_norm.weight': 'attention.kNorm.scale',
+    'attn_q_norm.weight': 'attention.qNorm.weight',
+    'attn_k_norm.weight': 'attention.kNorm.weight',
     'conv_dw.weight': 'shortConv.depthwise',
     'conv_pw1.weight': 'shortConv.inProj.weight',
     'conv_pw2.weight': 'shortConv.outProj.weight',
     'ffn_gate.weight': 'ffn.gate.weight',
     'ffn_up.weight': 'ffn.up.weight',
     'ffn_down.weight': 'ffn.down.weight',
-    'attn_post_norm.weight': 'postOperatorNorm.scale',
-    'ffn_post_norm.weight': 'postFfnNorm.scale',
-    'ln1.weight': 'operatorNorm.scale',
-    'ln2.weight': 'ffnNorm.scale',
+    'attn_post_norm.weight': 'postOperatorNorm.weight',
+    'ffn_post_norm.weight': 'postFfnNorm.weight',
+    'ln1.weight': 'operatorNorm.weight',
+    'ln2.weight': 'ffnNorm.weight',
   };
   const mapped = projections[suffix];
   if (!mapped) throw new Error(`unrecognized LiquidCodec tensor suffix '${suffix}'`);
@@ -835,6 +835,7 @@ function padQuantizedRows(tensor: QuantTensor, rows: number): QuantTensor {
     bits: tensor.bits,
     groupSize: tensor.groupSize,
     byteLength: 0,
+    sources: tensor.sources,
     async ints() {
       const source = await tensor.ints();
       const padded = new Int8Array(rows * columns);
@@ -861,15 +862,11 @@ function padFloatVector(tensor: LazyTensor, rows: number): LazyTensor {
   ) {
     throw new Error(`cannot pad LiquidCodec output bias to ${rows} rows`);
   }
-  return derivedTensor(
-    [rows],
-    async () => {
-      const padded = new Float32Array(rows);
-      padded.set(await tensor.f32());
-      return padded;
-    },
-    tensor.byteLength,
-  );
+  return deriveFromTensors([rows], [tensor], async () => {
+    const padded = new Float32Array(rows);
+    padded.set(await tensor.f32());
+    return padded;
+  });
 }
 
 function permuteProjection(
@@ -912,7 +909,7 @@ export class Lfm3AudioModel extends nn.Module {
         `depthDecoder.books.${book}.head.weight`,
         padQuantizedRows(embedding, CODEBOOK_HEAD_ROWS),
       );
-      mapped.set(`depthDecoder.books.${book}.norm.scale`, norm);
+      mapped.set(`depthDecoder.books.${book}.norm.weight`, norm);
     }
     const qOrder = rowOrder(AUDIO_HEADS, AUDIO_HEAD_DIM);
     const kOrder = rowOrder(AUDIO_KV_HEADS, AUDIO_HEAD_DIM);
