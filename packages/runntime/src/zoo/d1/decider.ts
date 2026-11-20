@@ -4,16 +4,20 @@
 
 import {
   cat,
-  defaultExecutor,
+  defaultRoot,
   evalValues,
+  gpuExecutor,
+  RunntimeError,
   slice,
   tensor,
   toArray,
   type LazyStateDict,
   type Value,
 } from '../../core/index.ts';
+import { asLoadError, rethrowRunError } from '../errors.ts';
+import { throwIfAborted } from '../load.ts';
 import { preprocessImage, resizeAA, type RgbImage } from './image.ts';
-import { D1, D1Model } from './model.ts';
+import { D1, D1Model, D1TextModel } from './model.ts';
 import {
   encodeQuestion,
   optionCount,
@@ -38,8 +42,16 @@ export interface D1Decider {
     state: string,
     questions: Record<string, Question>,
     images?: readonly RgbImage[],
+    options?: { signal?: AbortSignal },
   ): Promise<{ answers: Record<string, Answer>; inputTokens: number }>;
-  dispose(): void;
+  /** Stops accepting work and releases owned resources after queued work settles. */
+  dispose(): Promise<void>;
+}
+
+interface D1DeciderOptions {
+  temperatures?: Record<string, number>;
+  onProgress?: (name: string, done: number, total: number) => void;
+  signal?: AbortSignal;
 }
 
 /** Pair-duplicated RoPE tables [T, headDim] for positions 0..T−1. */
@@ -61,118 +73,213 @@ function ropeTables(t: number): { cos: Float32Array; sin: Float32Array } {
 export async function createD1Decider(
   sd: LazyStateDict,
   tokenizer: D1Tokenizer,
-  opts: {
-    temperatures?: Record<string, number>;
-    onProgress?: (name: string, done: number, total: number) => void;
-  } = {},
+  opts: D1DeciderOptions = {},
 ): Promise<D1Decider> {
-  const model = new D1Model();
-  await model.loadStateDict(sd, { onProgress: opts.onProgress });
-  const ex = defaultExecutor();
-  const temperatures = opts.temperatures ?? {};
-  const zeroRow = tensor(new Float32Array(D1.hidden), [1, D1.hidden]);
+  return createD1DeciderWithModel(sd, tokenizer, new D1Model(), opts);
+}
 
-  const posTable = model.vision.position_embedding.data;
-  if (!(posTable instanceof Float32Array)) throw new Error('d1: position table must be f32');
+/** Loads the text-only D1 model and ignores audio and vision checkpoint tensors. */
+export async function createD1TextDecider(
+  sd: LazyStateDict,
+  tokenizer: D1Tokenizer,
+  opts: D1DeciderOptions = {},
+): Promise<D1Decider> {
+  return createD1DeciderWithModel(sd, tokenizer, new D1TextModel(), opts);
+}
 
-  /** One image's crops through the tower and projector, rows concatenated. */
-  const encodeImage = (img: RgbImage): { prefix: Value; uploads: Value[] } => {
-    const uploads: Value[] = [];
-    const parts = preprocessImage(img).map(({ ph, pw, patches }) => {
-      const pos = resizeAA(posTable, D1.posGrid, D1.posGrid, D1.visionHidden, ph, pw);
-      const p = tensor(patches, [ph * pw, 3 * 16 * 16]);
-      const q = tensor(pos, [ph * pw, D1.visionHidden]);
-      uploads.push(p, q);
-      return model.vision.forward(p, q, ph, pw);
+async function createD1DeciderWithModel(
+  sd: LazyStateDict,
+  tokenizer: D1Tokenizer,
+  model: D1TextModel,
+  opts: D1DeciderOptions,
+): Promise<D1Decider> {
+  const root = defaultRoot();
+  const ex = gpuExecutor(root);
+  let zeroRow: Value | undefined;
+  try {
+    throwIfAborted(opts.signal);
+    await model.loadStateDict(sd, {
+      root,
+      onProgress: (name, done, total) => {
+        opts.onProgress?.(name, done, total);
+        throwIfAborted(opts.signal);
+      },
     });
-    return { prefix: parts.length === 1 ? parts[0]! : cat(parts, 0), uploads };
-  };
+    throwIfAborted(opts.signal);
+    zeroRow = tensor(root, new Float32Array(D1.hidden), [1, D1.hidden]);
 
-  const runQuestion = async (
-    prefix: Value | undefined,
-    ids: number[],
-    q: Question,
-    markers: number[],
-  ) => {
-    const p = prefix ? prefix.shape.dims![0]! : 0;
-    const t = p + ids.length;
-    const emb = model.encoder.embed_tokens.forward(ids);
-    const { cos: c, sin: s } = ropeTables(t);
-    const cos = tensor(c, [t, D1.headDim]);
-    const sin = tensor(s, [t, D1.headDim]);
-    const uploads = [emb, cos, sin];
-    let segments: Value | undefined;
-    let keepRight: Value | undefined;
-    if (p > 0) {
-      const seg = new Float32Array(2 * t);
-      const keep = new Float32Array(t).fill(1);
-      for (let i = 0; i < t; i++) seg[2 * i + 1] = i < p ? p : t;
-      keep[p - 1] = 0;
-      segments = tensor(seg, [t, 2]);
-      keepRight = tensor(keep, [t, 1]);
-      uploads.push(segments, keepRight);
-    }
-    const typeRow = model.head.type_emb.forward([QTYPES[q.type]]);
-    uploads.push(typeRow);
-    const h = model.encoder.forward(prefix ? cat([prefix, emb], 0) : emb, {
-      cos,
-      sin,
-      segments,
-      keepRight,
-      zeroRow,
-    });
-    const text = p > 0 ? slice(h, 0, p, t) : h;
-    const logits = await toArray(model.head.forward(text, typeRow, markers), ex);
-    for (const u of uploads) u.buffer.destroy();
-    return Array.from(logits.subarray(0, optionCount(q)));
-  };
+    const temperatures = opts.temperatures ?? {};
 
-  const systemOne: D1Decider['systemOne'] = async (state, questions, images) => {
-    let prefix: Value | undefined;
-    let imageUploads: Value[] = [];
-    if (images && images.length > 0) {
-      const encoded = images.map(encodeImage);
-      prefix =
-        encoded.length === 1
-          ? encoded[0]!.prefix
-          : cat(
-              encoded.map((e) => e.prefix),
-              0,
+    let disposed = false;
+    let queue: Promise<void> = Promise.resolve();
+    let disposePromise: Promise<void> | undefined;
+
+    const releaseAfterWork = async () => {
+      try {
+        await root.device.queue.onSubmittedWorkDone();
+      } catch {
+        // Device loss rejects the queue wait; owned buffers still need teardown.
+      }
+    };
+
+    /** One image's crops through the tower and projector, rows concatenated. */
+    const encodeImage = (img: RgbImage, uploads: Value[]): Value => {
+      if (!(model instanceof D1Model)) {
+        throw new RunntimeError('INVALID_ARGUMENT', 'D1 text decider does not accept images');
+      }
+      const posTable = model.vision.position_embedding.data;
+      if (!(posTable instanceof Float32Array)) throw new Error('d1: position table must be f32');
+      const parts = preprocessImage(img).map(({ ph, pw, patches }) => {
+        const pos = resizeAA(posTable, D1.posGrid, D1.posGrid, D1.visionHidden, ph, pw);
+        const p = tensor(root, patches, [ph * pw, 3 * 16 * 16]);
+        uploads.push(p);
+        const q = tensor(root, pos, [ph * pw, D1.visionHidden]);
+        uploads.push(q);
+        return model.vision.forward(p, q, ph, pw);
+      });
+      return parts.length === 1 ? parts[0]! : cat(parts, 0);
+    };
+
+    const runQuestion = async (
+      prefix: Value | undefined,
+      ids: number[],
+      q: Question,
+      markers: number[],
+      signal?: AbortSignal,
+    ): Promise<number[]> => {
+      const uploads: Value[] = [];
+      let output: Value | undefined;
+      try {
+        throwIfDecisionAborted(signal);
+        const p = prefix ? prefix.shape.dims![0]! : 0;
+        const t = p + ids.length;
+        const emb = track(model.encoder.embed_tokens.forward(ids, root), uploads);
+        const { cos: c, sin: s } = ropeTables(t);
+        const cos = track(tensor(root, c, [t, D1.headDim]), uploads);
+        const sin = track(tensor(root, s, [t, D1.headDim]), uploads);
+        let segments: Value | undefined;
+        let keepRight: Value | undefined;
+        if (p > 0) {
+          const seg = new Float32Array(2 * t);
+          const keep = new Float32Array(t).fill(1);
+          for (let i = 0; i < t; i++) seg[2 * i + 1] = i < p ? p : t;
+          keep[p - 1] = 0;
+          segments = track(tensor(root, seg, [t, 2]), uploads);
+          keepRight = track(tensor(root, keep, [t, 1]), uploads);
+        }
+        const typeRow = track(model.head.type_emb.forward([QTYPES[q.type]], root), uploads);
+        const h = model.encoder.forward(prefix ? cat([prefix, emb], 0) : emb, {
+          cos,
+          sin,
+          segments,
+          keepRight,
+          zeroRow: zeroRow!,
+        });
+        const text = p > 0 ? slice(h, 0, p, t) : h;
+        output = model.head.forward(text, typeRow, markers);
+        const logits = await toArray(output, ex);
+        throwIfDecisionAborted(signal);
+        return Array.from(logits.subarray(0, optionCount(q)));
+      } finally {
+        await releaseAfterWork();
+        if (output) ex.releaseValues([output]);
+        for (const value of uploads) value.buffer.destroy();
+        ex.trim();
+      }
+    };
+
+    const systemOne: D1Decider['systemOne'] = (state, questions, images, options) => {
+      if (disposed) {
+        return Promise.reject(new RunntimeError('RESOURCE_DISPOSED', 'D1 decider is disposed'));
+      }
+      if (images && images.length > 0 && !(model instanceof D1Model)) {
+        return Promise.reject(
+          new RunntimeError('INVALID_ARGUMENT', 'D1 text decider does not accept images'),
+        );
+      }
+      const job = queue.then(async () => {
+        if (disposed) throw new RunntimeError('RESOURCE_DISPOSED', 'D1 decider is disposed');
+        const signal = options?.signal;
+        let prefix: Value | undefined;
+        const imageUploads: Value[] = [];
+        try {
+          throwIfDecisionAborted(signal);
+          if (images && images.length > 0) {
+            const parts = images.map((img) => encodeImage(img, imageUploads));
+            prefix = parts.length === 1 ? parts[0]! : cat(parts, 0);
+            evalValues([prefix], ex);
+          }
+          const p = prefix ? prefix.shape.dims![0]! : 0;
+          const maxLen = Math.min(prefix ? IMAGE_TEXT_LENGTH : MAX_LENGTH, MAX_LENGTH - p);
+          const answers: Record<string, Answer> = {};
+          let inputTokens = 0;
+          for (const [name, q] of Object.entries(questions)) {
+            throwIfDecisionAborted(signal);
+            const { ids, markers } = encodeQuestion(
+              tokenizer,
+              state,
+              q,
+              maxLen,
+              prefix ? YES_NO : undefined,
             );
-      imageUploads = encoded.flatMap((e) => e.uploads);
-      evalValues([prefix], ex);
-    }
-    const p = prefix ? prefix.shape.dims![0]! : 0;
-    const maxLen = Math.min(prefix ? IMAGE_TEXT_LENGTH : MAX_LENGTH, MAX_LENGTH - p);
-    const answers: Record<string, Answer> = {};
-    let inputTokens = 0;
-    for (const [name, q] of Object.entries(questions)) {
-      const { ids, markers } = encodeQuestion(
-        tokenizer,
-        state,
-        q,
-        maxLen,
-        prefix ? YES_NO : undefined,
+            inputTokens += p + ids.length;
+            const logits = await runQuestion(prefix, ids, q, markers, signal);
+            const temperature = prefix
+              ? 1
+              : (temperatures[temperatureKey(q)] ?? temperatures[q.type] ?? 1);
+            const probs = softmaxT(logits, temperature);
+            // The model reads a noul as [false, true]; answers want [yes, no].
+            answers[name] = toAnswer(q, q.type === 'noul' ? probs.reverse() : probs);
+          }
+          return { answers, inputTokens };
+        } finally {
+          await releaseAfterWork();
+          if (prefix) ex.releaseValues([prefix]);
+          for (const value of imageUploads) value.buffer.destroy();
+          ex.trim();
+        }
+      });
+      const result = job.catch(rethrowRunError);
+      queue = result.then(
+        () => undefined,
+        () => undefined,
       );
-      inputTokens += p + ids.length;
-      const logits = await runQuestion(prefix, ids, q, markers);
-      const temperature = prefix
-        ? 1
-        : (temperatures[temperatureKey(q)] ?? temperatures[q.type] ?? 1);
-      const probs = softmaxT(logits, temperature);
-      // The model reads a noul as [false, true]; answers want [yes, no].
-      answers[name] = toAnswer(q, q.type === 'noul' ? probs.reverse() : probs);
-    }
-    if (prefix) ex.releaseValues([prefix]);
-    for (const u of imageUploads) u.buffer.destroy();
-    return { answers, inputTokens };
-  };
+      return result;
+    };
 
-  return {
-    systemOne,
-    dispose: () => {
-      zeroRow.buffer.destroy();
+    const dispose = (): Promise<void> => {
+      if (disposePromise) return disposePromise;
+      disposed = true;
+      disposePromise = queue.then(() => {
+        try {
+          model.dispose();
+        } finally {
+          zeroRow?.buffer.destroy();
+          ex.dispose();
+        }
+      });
+      return disposePromise;
+    };
+
+    return { systemOne, dispose };
+  } catch (err) {
+    try {
       model.dispose();
-    },
-  };
+    } finally {
+      zeroRow?.buffer.destroy();
+      ex.dispose();
+    }
+    throw asLoadError(err, opts.signal);
+  }
+}
+
+function track(value: Value, uploads: Value[]): Value {
+  uploads.push(value);
+  return value;
+}
+
+function throwIfDecisionAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) {
+    throw new RunntimeError('EXECUTION_FAILED', 'D1 decision aborted', { cause: signal.reason });
+  }
 }

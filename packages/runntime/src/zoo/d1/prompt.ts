@@ -5,6 +5,8 @@
  *
  *  and the head scores the hidden state at each `<mask>`. */
 
+import { RunntimeError } from '../../core/error.ts';
+
 /** Question type to the head's type-embedding row. */
 export const QTYPES = { choice: 0, score: 1, noul: 2 } as const;
 export type QuestionType = keyof typeof QTYPES;
@@ -35,8 +37,6 @@ const DELIM = {
   decide: '<|reserved_11|>',
 };
 const MARKER = '<|mask|>';
-/** Tokens each option text may take before it is cut. */
-const PER_OPTION = 24;
 /** How image questions were trained: noul options read as plain yes/no. */
 export const YES_NO = { false: 'no', true: 'yes' } as const;
 
@@ -59,9 +59,7 @@ function renderOptions(q: Question, noulDefault?: { false: string; true: string 
   ];
 }
 
-/** Token ids of one question over one state, and each option marker's
- *  position. The option block gets max(96, min(24k + 32, maxLen / 2)) tokens;
- *  the state is cut on the right to what is left. */
+/** Token ids of one complete question and state, and each option marker's position. */
 export function encodeQuestion(
   tok: D1Tokenizer,
   state: string,
@@ -71,26 +69,29 @@ export function encodeQuestion(
 ): { ids: number[]; markers: number[] } {
   const enc = (s: string) => tok.encode(escape(s));
   const opts = renderOptions(q, noulDefault);
-  const budget = Math.max(96, Math.min(opts.length * PER_OPTION + 32, Math.floor(maxLen / 2)));
-  const per = Math.max(2, Math.floor((budget - 3 * opts.length) / opts.length));
-  const question = [tok.tokenId(DELIM.q), ...enc(q.instructions)].slice(0, Math.max(16, budget));
+  const question = [tok.tokenId(DELIM.q), ...enc(q.instructions)];
   const markers: number[] = [];
   for (const text of opts) {
     markers.push(question.length + 1);
     question.push(
       tok.tokenId(DELIM.opt),
       tok.tokenId(MARKER),
-      ...enc(' ' + text).slice(0, per),
+      ...enc(' ' + text),
       tok.tokenId(DELIM.optEnd),
     );
   }
   question.push(tok.tokenId(DELIM.decide));
   const room = Math.max(0, maxLen - question.length - 2);
-  const stateIds = [tok.tokenId(DELIM.state), ...enc(state).slice(0, room)];
-  const ids = [tok.bosId, ...stateIds, ...question].slice(0, maxLen);
+  const stateTokens = enc(state);
+  if (question.length + 2 > maxLen || stateTokens.length > room) {
+    throw new RunntimeError(
+      'INVALID_ARGUMENT',
+      `D1 prompt exceeds its ${maxLen}-token context (${stateTokens.length} state tokens and ${question.length} question tokens)`,
+    );
+  }
+  const stateIds = [tok.tokenId(DELIM.state), ...stateTokens];
+  const ids = [tok.bosId, ...stateIds, ...question];
   const shifted = markers.map((m) => m + 1 + stateIds.length);
-  if (shifted[shifted.length - 1]! >= maxLen)
-    throw new Error('the options do not fit in the context');
   return { ids, markers: shifted };
 }
 
