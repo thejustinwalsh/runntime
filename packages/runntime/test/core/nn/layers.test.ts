@@ -23,6 +23,7 @@ import {
   derive,
   fromSafetensors,
   memoryStateDict,
+  quantTensor,
   type LazyStateDict,
 } from '../../../src/core/weights/safetensors.ts';
 import { scaleWeight } from '../../../src/core/weights/transforms.ts';
@@ -403,10 +404,48 @@ describe('Linear with a quantized weight', () => {
         layer.bias!.value,
         addend,
       ]);
-      // baseRow, scaleBase, bits, groupSize, bias, addend, activation
-      expect(y.pending?.attrs).toEqual([0, 0, 8, 4, 1, 1, ACT_CODE.gelu]);
+      // baseRow, scaleBase, bits, groupSize, offset, bias, addend, activation
+      expect(y.pending?.attrs).toEqual([0, 0, 8, 4, 0, 1, 1, ACT_CODE.gelu]);
     },
   );
+
+  it('adds a weightOffset in [groups, out] order and passes it to the matmul', async () => {
+    // torch [out 4, groups 2]: offset o·10 + g
+    const tensor = quantTensor({
+      name: 'w',
+      shape: [4, 8],
+      bits: 8,
+      groupSize: 4,
+      byteLength: 0,
+      sources: [],
+      ints: async () => new Int8Array(32),
+      scales: async () => new Float32Array(8).fill(1),
+      offsets: async () =>
+        Float32Array.from({ length: 8 }, (_, i) => Math.floor(i / 2) * 10 + (i % 2)),
+    });
+    const sd: LazyStateDict = {
+      metadata: {},
+      tensors: new Map([['weight', tensor]]),
+      totalBytes: () => 0,
+    };
+    const layer = new Linear(8, 4);
+    layer.transformStateDict(sd, '');
+    expect([...sd.tensors.keys()]).toEqual(['weight', 'weightScale', 'weightOffset']);
+    const offsets = sd.tensors.get('weightOffset')!;
+    if (offsets.kind !== 'derived') throw new Error('expected a derived tensor');
+    // kernel layout [group, out]: [g·4 + o]
+    expect([...(await offsets.data())]).toEqual([0, 10, 20, 30, 1, 11, 21, 31]);
+    expect(layer.weightOffset?.shape).toEqual(meta([2, 4]));
+
+    fakeLoad(layer);
+    const y = layer.forward(input([5, 8]));
+    expect(y.pending?.inputs.slice(2, 4)).toEqual([
+      layer.weightScale!.value,
+      layer.weightOffset!.value,
+    ]);
+    // baseRow, scaleBase, bits, groupSize, offset, bias, addend, activation
+    expect(y.pending?.attrs).toEqual([0, 0, 8, 4, 1, 1, 0, 0]);
+  });
 
   it('refuses a weight in [in, out] layout', async () => {
     const sd = await quantCheckpoint(8, 4, { weight: { ints: numbered, scales, shape: [8, 4] } });

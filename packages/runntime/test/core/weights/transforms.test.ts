@@ -484,6 +484,27 @@ describe.each([8, 4] as const)('int%i quantized sources', (bits) => {
 });
 
 describe('quantized helpers', () => {
+  it('permuteRows keeps Q4 affine offsets aligned with their groups', async () => {
+    const tensor = quantTensor({
+      name: 'q4',
+      shape: [2, 4],
+      bits: 4,
+      groupSize: 2,
+      byteLength: 12,
+      sources: [],
+      ints: async () => new Int8Array([1, 2, 3, 4, 5, 6, 7, 8]),
+      scales: async () => new Float32Array([1, 2, 3, 4]),
+      offsets: async () => new Float32Array([10, 20, 30, 40]),
+    });
+    const out = permuteRows(tensor, [1, 0]);
+
+    expect(out.kind).toBe('quant');
+    if (out.kind !== 'quant') throw new Error('expected a quantized tensor');
+    expect(await out.ints()).toEqual(new Int8Array([5, 6, 7, 8, 1, 2, 3, 4]));
+    expect(await out.scales()).toEqual(new Float32Array([3, 4, 1, 2]));
+    expect(await out.offsets?.()).toEqual(new Float32Array([30, 40, 10, 20]));
+  });
+
   /** A [2, 2] int8 tensor in one group per row, counting its reads. */
   function counted() {
     const ints = vi.fn(async () => new Int8Array([1, 2, 3, 4]));
@@ -523,6 +544,22 @@ describe('quantized helpers', () => {
     expect(d.shape).toEqual([2, 2]);
     expect([...(await d.f32())]).toEqual([0.5, -1, 1.75, -2]);
     expect(d.byteLength).toBe(t.byteLength);
+  });
+
+  it('dequantize adds the offset of each group to its scaled ints', async () => {
+    // groups of 2: 1·1+10, 2·1+10, 3·2+20, 4·2+20
+    const t = quantTensor({
+      name: 'q',
+      shape: [1, 4],
+      bits: 4,
+      groupSize: 2,
+      byteLength: 0,
+      sources: [],
+      ints: async () => new Int8Array([1, 2, 3, 4]),
+      scales: async () => new Float32Array([1, 2]),
+      offsets: async () => new Float32Array([10, 20]),
+    });
+    expect([...(await dequantize(t).f32())]).toEqual([11, 12, 26, 28]);
   });
 
   it('dequantize refuses a shape of another size', () => {

@@ -329,10 +329,9 @@ export interface DerivedTensor extends LazyTensorBase {
   data(): Promise<Float32Array | Uint16Array | Uint32Array>;
 }
 
-/** Symmetric int weights with one scale per `groupSize` values along the last
- *  dim: value = int · scale of its group. `shape` is logical, one element per
- *  int even for int4, and `byteLength` covers the ints and the scales. The
- *  float accessors reject with CHECKPOINT_MISMATCH. */
+/** Quantized weights with one scale and optional affine term per `groupSize`
+ *  values along the last dim. `shape` is logical, one element per int even for
+ *  int4, and `byteLength` covers the source payload. */
 export interface QuantTensor extends LazyTensorBase {
   kind: 'quant';
   /** What the tensor is, for error messages: its name in the file, or the
@@ -345,6 +344,8 @@ export interface QuantTensor extends LazyTensorBase {
   /** Row-major, shape `[...lead, last / groupSize]`. F16 halfwords as stored
    *  in the file; f32 once a helper changed them. */
   scales(): Promise<Float32Array | Uint16Array>;
+  /** Optional per-group term added to `int · scale`. */
+  offsets?(): Promise<Float32Array | Uint16Array>;
 }
 
 export type LazyTensor = FileTensor | DerivedTensor | QuantTensor;
@@ -433,7 +434,15 @@ function fileTensor(name: string, info: SafeTensorInfo, source: RangeSource): Fi
 export function quantTensor(
   parts: Pick<
     QuantTensor,
-    'name' | 'shape' | 'bits' | 'groupSize' | 'byteLength' | 'sources' | 'ints' | 'scales'
+    | 'name'
+    | 'shape'
+    | 'bits'
+    | 'groupSize'
+    | 'byteLength'
+    | 'sources'
+    | 'ints'
+    | 'scales'
+    | 'offsets'
   >,
 ): QuantTensor {
   const refuse = () =>

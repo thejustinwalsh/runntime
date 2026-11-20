@@ -21,6 +21,8 @@ export interface MatmulOpts {
   activation?: SlotAct;
   baseRow?: number;
   scales?: Value;
+  /** Per-group terms added to each scaled int, f32 and shaped like `scales`. */
+  offsets?: Value;
   scaleBase?: number;
   bits?: 8 | 4;
   groupSize?: number;
@@ -34,7 +36,7 @@ export interface MatmulOpts {
  *  epilogue only as a whole weight. */
 export function matmul(a: Value, b: Value, opts: MatmulOpts = {}): Value {
   if (b.shape.dtype === 'quantW') {
-    const { scales, bits, groupSize } = opts;
+    const { scales, bits, groupSize, offsets } = opts;
     if (!scales || !bits || !groupSize) {
       throw new Error('matmul: quantW weights need scales, bits and groupSize');
     }
@@ -43,13 +45,14 @@ export function matmul(a: Value, b: Value, opts: MatmulOpts = {}): Value {
       scaleBase: opts.scaleBase ?? 0,
       bits,
       groupSize,
+      offsets,
       bias: opts.bias,
       addend: opts.addend,
       activation: opts.activation,
     });
   }
-  if (opts.scales || opts.bits || opts.groupSize) {
-    throw new Error('matmul: scales/bits/groupSize apply to quantW weights only');
+  if (opts.scales || opts.offsets || opts.bits || opts.groupSize) {
+    throw new Error('matmul: scales/offsets/bits/groupSize apply to quantW weights only');
   }
   const ad = a.shape.dims;
   const bd = b.shape.dims;
@@ -108,14 +111,18 @@ function matmulQuantW(
     scaleBase: number;
     bits: 8 | 4;
     groupSize: number;
+    offsets?: Value;
     bias?: Value;
     addend?: Value;
     activation?: SlotAct;
   },
 ): Value {
   const [m, k, dtype] = want2d('matmul', a, FLOAT_DTYPES);
-  const { baseRow, scaleBase, bits, groupSize } = opts;
+  const { baseRow, scaleBase, bits, groupSize, offsets } = opts;
   const [r, n] = wantQuantW('matmul', w, scales, bits);
+  if (offsets && (offsets.shape.dtype !== 'f32' || offsets.shape.elems !== scales.shape.elems)) {
+    throw new Error('matmul: offsets must be f32 and match scales');
+  }
   if (groupSize <= 0 || k % groupSize !== 0)
     throw new Error(`matmul: groupSize ${groupSize} must divide K ${k}`);
   if (k % 4 !== 0 || groupSize % 4 !== 0) {
@@ -164,13 +171,21 @@ function matmulQuantW(
   return pending(
     { elems: m * n, dtype, dims: [m, n] },
     'matmulQuantW',
-    [a, w, scales, ...(bias ? [bias] : []), ...(addend ? [addend] : [])],
+    [
+      a,
+      w,
+      scales,
+      ...(offsets ? [offsets] : []),
+      ...(bias ? [bias] : []),
+      ...(addend ? [addend] : []),
+    ],
     undefined,
     [
       baseRow,
       scaleBase,
       bits,
       groupSize,
+      offsets ? 1 : 0,
       bias ? 1 : 0,
       addend ? 1 : 0,
       activation ? ACT_CODE[activation] : 0,

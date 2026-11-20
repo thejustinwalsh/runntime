@@ -135,6 +135,7 @@ export const conv1dSpec = defineSpec({
             n: cfg.cOut,
             bits: cfg.bits,
             groupSize: cfg.groupSize,
+            hasOffset: 0,
             hasBias: cfg.hasBias,
             hasAdd: 0,
             act: cfg.act,

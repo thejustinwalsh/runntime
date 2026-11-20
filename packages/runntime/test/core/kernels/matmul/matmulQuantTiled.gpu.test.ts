@@ -1,7 +1,10 @@
-import { describe, it } from 'vitest';
+import { d } from 'typegpu';
+import { describe, expect, it } from 'vitest';
 import { toArray } from '../../../../src/core/gpu/eval.ts';
 import { matmul, type SlotAct } from '../../../../src/core/graph/ops.ts';
 import { matrix } from '../../../../src/core/graph/value.ts';
+import { createMatmulQuantTiledPipeline } from '../../../../src/core/kernels/matmul/matmulQuantTiled.ts';
+import { F32_ELEM } from '../../../../src/core/kernels/elem.ts';
 import { expectClose, gpu, randomF32, requireFeature, roundF16, upload } from '../../../gpu.ts';
 import { ACTIVATION_REF } from './checkMatmul.ts';
 import { randomQuantWeight } from './quantW.ts';
@@ -14,6 +17,7 @@ interface Case {
   n: number;
   bits: 4 | 8;
   groupSize: number;
+  offsets?: boolean;
   bias?: boolean;
   addend?: boolean;
   activation?: SlotAct;
@@ -25,13 +29,18 @@ async function checkQuantTiled(c: Case, dtype: 'f32' | 'f16') {
   const { m, k, n, bits, groupSize } = c;
   const round = dtype === 'f16' ? roundF16 : (v: Float32Array) => v;
   const meta = (rows: number, cols: number) => ({ ...matrix(rows, cols), dtype });
-  const weight = randomQuantWeight(root, { experts: 1, k, n, bits, groupSize }, 2);
+  const weight = randomQuantWeight(
+    root,
+    { experts: 1, k, n, bits, groupSize, offsets: c.offsets },
+    2,
+  );
   const a = round(randomF32(m * k, 1));
   const bias = c.bias ? round(randomF32(n, 3)) : undefined;
   const addend = c.addend ? round(randomF32(m * n, 4)) : undefined;
   const got = await toArray(
     matmul(upload(root, a, meta(m, k)), weight.w, {
       scales: upload(root, weight.scales, [k / groupSize, n]),
+      offsets: weight.offsets && upload(root, weight.offsets, [k / groupSize, n]),
       bits,
       groupSize,
       bias: bias && upload(root, bias, meta(1, n)),
@@ -92,5 +101,15 @@ describe('matmulQuantTiled kernel', () => {
   )('$dtype int$bits with $name on 2048 rows', async ({ dtype, ...e }, ctx) => {
     if (dtype === 'f16') requireFeature(ctx, root, 'shader-f16');
     await checkQuantTiled({ m: 2048, k: 64, n: 24, groupSize: 16, ...e }, dtype);
+  });
+
+  it('applies Q4_K affine minima through the tiled route', () =>
+    checkQuantTiled({ m: 32, k: 32, n: 2048, bits: 4, groupSize: 32, offsets: true }, 'f32'));
+
+  it('refuses offsets with a custom scale layout', () => {
+    const cfg = { k: 32, n: 32, bits: 8, groupSize: 32, hasOffset: 1, hasBias: 0, hasAdd: 0 };
+    expect(() =>
+      createMatmulQuantTiledPipeline(root, cfg, F32_ELEM, undefined, () => d.vec4f()),
+    ).toThrow('default scale layout');
   });
 });

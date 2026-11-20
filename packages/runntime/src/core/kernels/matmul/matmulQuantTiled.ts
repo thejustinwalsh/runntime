@@ -29,6 +29,7 @@ function makeLayout(elem: Elem) {
     a: { storage: d.arrayOf(elem.vec4), access: 'readonly' },
     w: { storage: d.arrayOf(d.u32), access: 'readonly' },
     scales: { storage: d.arrayOf(d.vec4f), access: 'readonly' }, // read through scaleAt
+    offsets: { storage: d.arrayOf(d.vec4f), access: 'readonly' }, // [K/group, N/4]; dead when hasOffset=0
     bias: { storage: d.arrayOf(elem.vec4), access: 'readonly' }, // [N/4]; dead when hasBias=0
     addend: { storage: d.arrayOf(elem.vec4), access: 'readonly' }, // [M,N/4]; dead when hasAdd=0
     out: { storage: d.arrayOf(elem.vec4), access: 'mutable' },
@@ -97,7 +98,7 @@ export function matmulQuantTiledEligible(k: number, n: number, groupSize?: numbe
 }
 
 function makeMatmulQuantTiledKernel(cfg: MatmulQuantTiledCfg, elem: Elem) {
-  const { k, n, bits, hasBias, hasAdd } = cfg;
+  const { k, n, bits, groupSize, hasOffset, hasBias, hasAdd } = cfg;
   const layout = layoutFor(elem);
   const storeVec4 = elem.vec4;
   const bk4 = BK / 4;
@@ -142,6 +143,7 @@ function makeMatmulQuantTiledKernel(cfg: MatmulQuantTiledCfg, elem: Elem) {
     let w2 = d.u32(0);
     let w3 = d.u32(0);
     let scale = d.vec4f();
+    let offset = d.vec4f();
     if (am < m) {
       ra = storeVec4(loadASlot.$(am, aCol));
     }
@@ -152,10 +154,17 @@ function makeMatmulQuantTiledKernel(cfg: MatmulQuantTiledCfg, elem: Elem) {
       w2 = layout.$.w[wb + cw2]!;
       w3 = layout.$.w[wb + cw3]!;
       scale = scaleAtSlot.$(bRow, bc4);
+      if (hasOffset > 0) {
+        offset = d.vec4f(layout.$.offsets[std.intdiv(bRow, groupSize) * n4 + bc4]!);
+      }
     }
     for (const t of std.range(tiles)) {
+      let wv = storeVec4(deqRow(w0, w1, w2, w3, bRow % 4, bits) * scale);
+      if (hasOffset > 0) {
+        wv = storeVec4(d.vec4f(wv) + offset);
+      }
       tileA.$[lid] = storeVec4(ra);
-      tileB.$[lid] = storeVec4(deqRow(w0, w1, w2, w3, bRow % 4, bits) * scale);
+      tileB.$[lid] = storeVec4(wv);
       std.workgroupBarrier();
       // The next tile's loads are in flight while this one computes.
       const tn = t + 1;
@@ -172,6 +181,9 @@ function makeMatmulQuantTiledKernel(cfg: MatmulQuantTiledCfg, elem: Elem) {
           w2 = layout.$.w[wb + cw2]!;
           w3 = layout.$.w[wb + cw3]!;
           scale = scaleAtSlot.$(bk, bc4);
+          if (hasOffset > 0) {
+            offset = d.vec4f(layout.$.offsets[std.intdiv(bk, groupSize) * n4 + bc4]!);
+          }
         }
       }
 
@@ -220,18 +232,22 @@ function makeMatmulQuantTiledKernel(cfg: MatmulQuantTiledCfg, elem: Elem) {
 
 /** One pipeline per dtype, K, N, bits, group size, loaders, epilogue and
  *  activation. `loadA` reads a; by default it reads rows aStride apart.
- *  `scaleAt` reads the scales; by default [K / groupSize, N]. */
+ *  `scaleAt` reads the scales; by default [K / groupSize, N]. Offsets are read
+ *  from the default layout only, so a custom `scaleAt` takes `hasOffset: 0`. */
 export function createMatmulQuantTiledPipeline(
   root: TgpuRoot,
   cfg: MatmulQuantTiledCfg,
   elem: Elem = F32_ELEM,
   loadA: LoadA = stridedLoadA(elem, cfg.aStride ?? cfg.k, layoutFor(elem)),
-  scaleAt: ScaleAt = groupedScales(elem, cfg.n, cfg.groupSize),
+  scaleAt?: ScaleAt,
 ) {
+  if (scaleAt && cfg.hasOffset > 0) {
+    throw new Error('matmulQuantTiled: offsets are read in the default scale layout only');
+  }
   return root
     .with(actSlot, activationFor(cfg.act))
     .with(loadASlot, loadA)
-    .with(scaleAtSlot, scaleAt)
+    .with(scaleAtSlot, scaleAt ?? groupedScales(elem, cfg.n, cfg.groupSize))
     .createComputePipeline({ compute: makeMatmulQuantTiledKernel(cfg, elem) });
 }
 
@@ -250,6 +266,7 @@ export function matmulQuantTiledHandle(
   // Absent epilogue operands alias `a`; those pipelines never read them.
   const bindGroup = cachedBindGroup(root, layoutFor(elem), {
     ...buffers,
+    offsets: buffers.offsets ?? buffers.scales,
     bias: buffers.bias ?? buffers.a,
     addend: buffers.addend ?? buffers.a,
     dims,

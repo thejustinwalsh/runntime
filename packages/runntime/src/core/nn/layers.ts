@@ -118,8 +118,9 @@ export class Embedding extends Module<[readonly number[] | Value], Value> {
 
 /** Turns `weight` into quantW words [k, n], packed from `ints` with one row
  *  of k per output, and puts its f32 scales right after it as
- *  `<prefix>.weightScale`, so both bind in file order. The words carry t's
- *  whole download size. Returns the scale parameter. */
+ *  `<prefix>.weightScale`, so both bind in file order, then `offsets`, when
+ *  given, as `<prefix>.weightOffset`. The words carry t's whole download
+ *  size. Returns the scale parameter. */
 function loadQuantWeight(
   sd: LazyStateDict,
   prefix: string,
@@ -128,6 +129,7 @@ function loadQuantWeight(
   shape: { k: number; n: number },
   ints: () => Promise<Int8Array>,
   scales: { dims: number[]; data: () => Promise<Float32Array> },
+  offsets?: { dims: number[]; data: () => Promise<Float32Array> },
 ): Parameter {
   const { k, n } = shape;
   const at = (name: string) => (prefix ? `${prefix}.${name}` : name);
@@ -141,6 +143,9 @@ function loadQuantWeight(
     sd.tensors.set(key, key === at('weight') ? words : tensor);
     if (key === at('weight')) {
       sd.tensors.set(at('weightScale'), deriveFromTensors(scales.dims, [t], scales.data, 0));
+      if (offsets) {
+        sd.tensors.set(at('weightOffset'), deriveFromTensors(offsets.dims, [t], offsets.data, 0));
+      }
     }
   }
   return scale;
@@ -152,15 +157,23 @@ async function scalesF32(t: QuantTensor): Promise<Float32Array> {
   return data instanceof Float32Array ? data : f16ToF32(data);
 }
 
-/** `t`'s scales, torch's [out, groups], as the kernels' [groups, n] in f32.
- *  Columns past out stay 0. */
-async function scaleColumns(t: QuantTensor, groups: number, n: number): Promise<Float32Array> {
-  const f32 = await scalesF32(t);
+/** torch's [out, groups] per-group values `f32` of `t` as the kernels'
+ *  [groups, n] in f32. Columns past out stay 0. */
+function groupColumns(t: QuantTensor, f32: Float32Array, groups: number, n: number): Float32Array {
   const out = new Float32Array(groups * n);
   for (let o = 0; o < t.shape[0]!; o++) {
     for (let g = 0; g < groups; g++) out[g * n + o] = f32[o * groups + g]!;
   }
   return out;
+}
+
+async function scaleColumns(t: QuantTensor, groups: number, n: number): Promise<Float32Array> {
+  return groupColumns(t, await scalesF32(t), groups, n);
+}
+
+async function offsetColumns(t: QuantTensor, groups: number, n: number): Promise<Float32Array> {
+  const data = await t.offsets!();
+  return groupColumns(t, data instanceof Float32Array ? data : f16ToF32(data), groups, n);
 }
 
 /** y = x @ weight + bias. weight is stored [in, out]; torch checkpoints
@@ -179,6 +192,8 @@ export class Linear extends Module {
   readonly activation?: SlotAct;
   /** Set when a quantized weight loads. */
   weightScale?: Parameter;
+  /** Per-group affine term set by an asymmetric quantized weight. */
+  weightOffset?: Parameter;
   /** How the loaded weight is quantized, or undefined for a float weight. */
   private quantization?: { bits: 4 | 8; groupSize: number };
   constructor(
@@ -247,7 +262,13 @@ export class Linear extends Module {
       { k, n },
       () => tensor.ints(),
       { dims: [groups, n], data: () => scaleColumns(tensor, groups, n) },
+      tensor.offsets
+        ? { dims: [groups, n], data: () => offsetColumns(tensor, groups, n) }
+        : undefined,
     );
+    this.weightOffset = tensor.offsets
+      ? new Parameter({ elems: groups * n, dtype: 'f32', dims: [groups, n] }, undefined, true)
+      : undefined;
   }
   forward(x: Value, call: { addend?: Value } = {}): Value {
     if (!this.weightScale || !this.quantization) {
@@ -255,6 +276,7 @@ export class Linear extends Module {
     }
     return matmul(x, this.weight.value, {
       scales: this.weightScale.value,
+      offsets: this.weightOffset?.value,
       ...this.quantization,
       bias: this.bias?.value,
       addend: call.addend,

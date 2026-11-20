@@ -115,8 +115,8 @@ describe('matmul', () => {
       const c = matmul(a, quantWeight(8, 16, bits), { ...q, bits });
       expect(c.shape).toEqual(meta([2, 16]));
       expect(c.pending?.op).toBe('matmulQuantW');
-      // attrs: baseRow, scaleBase, bits, groupSize, hasBias, hasAdd, act
-      expect(c.pending?.attrs).toEqual([0, 0, bits, 4, 0, 0, 0]);
+      // attrs: baseRow, scaleBase, bits, groupSize, hasOffset, hasBias, hasAdd, act
+      expect(c.pending?.attrs).toEqual([0, 0, bits, 4, 0, 0, 0, 0]);
     });
 
     it('gives f16 [M, N] for f16 activations', () => {
@@ -129,7 +129,7 @@ describe('matmul', () => {
       const addend = input([2, 16]);
       const c = matmul(a, quantWeight(8, 16, 8), { ...q, bias, addend, activation: 'silu' });
       expect(c.pending?.inputs.slice(3)).toEqual([bias, addend]);
-      expect(c.pending?.attrs?.slice(4)).toEqual([1, 1, ACT_CODE.silu]);
+      expect(c.pending?.attrs?.slice(4)).toEqual([0, 1, 1, ACT_CODE.silu]);
     });
 
     it('reads one expert of a fused weight with a K-aligned baseRow', () => {
