@@ -14,6 +14,8 @@ export interface DispatchExtras {
 export interface Executor {
   acquireOutput(shape: ValueMeta): GpuBufferRef;
   releaseOutput(buffer: GpuBufferRef, shape: ValueMeta): void;
+  /** Discards commands queued by a failed evaluation before they are submitted. */
+  discard?(): void;
   dispatch(
     node: Value,
     inputs: readonly GpuBufferRef[],
@@ -177,93 +179,114 @@ export function evalValues(targets: readonly Value[], ex: Executor): void {
 
   // Acquired by the first elided writer, always before the concat itself.
   const holderBuf = new Map<Value, GpuBufferRef>();
+  const acquired = new Map<GpuBufferRef, ValueMeta>();
+  const acquireOutput = (shape: ValueMeta): GpuBufferRef => {
+    const buffer = ex.acquireOutput(shape);
+    acquired.set(buffer, shape);
+    return buffer;
+  };
+  const releaseOutput = (buffer: GpuBufferRef, shape: ValueMeta): void => {
+    acquired.delete(buffer);
+    ex.releaseOutput(buffer, shape);
+  };
   const bufferFor = (holder: Value) => {
     let buf = holderBuf.get(holder);
     if (buf === undefined) {
-      buf = ex.acquireOutput(holder.shape);
+      buf = acquireOutput(holder.shape);
       holderBuf.set(holder, buf);
     }
     return buf;
   };
 
-  order.forEach((v, i) => {
-    const aliasedConv = addAlias.get(v);
-    if (IN_PLACE_OPS.has(v.pending!.op)) {
-      // In-place op: writes rows of its first input's caller-owned buffer.
-      const out = v.pending!.inputs[0]!.buffer;
-      const inputs = v.pending!.inputs.map((input) => input.buffer);
-      ex.dispatch(v, inputs, out);
-      v.setMaterialized(out);
-    } else if (aliasedConv !== undefined) {
-      // Fused add: the conv already wrote act(conv)+x — just take its buffer.
-      v.setMaterialized(aliasedConv.buffer);
-    } else if (
-      (v.pending!.op === 'concatChannels' || v.pending!.op === 'concatChannelsHwc4') &&
-      concatInto.has(v)
-    ) {
-      // Writers targeted the holder directly; copy only what was not elided.
-      const slot = concatInto.get(v)!;
-      const buf = bufferFor(slot.holder);
-      const [a, b] = v.pending!.inputs as [Value, Value];
-      [a, b].forEach((inp, j) => {
-        if (!ownedElsewhere.has(inp)) {
-          ex.copyInto!(
-            inp.buffer,
-            buf,
-            inp.shape,
-            slot.holder.shape,
-            slot.base + (j === 0 ? 0 : a.shape.elems),
-          );
-        }
-      });
-      v.setMaterialized(buf);
-    } else if (
-      (v.pending!.op === 'concatChannels' || v.pending!.op === 'concatChannelsHwc4') &&
-      ex.copyInto &&
-      holderBuf.has(v)
-    ) {
-      // Root concat with at least one elided input.
-      const buf = bufferFor(v);
-      const [a, b] = v.pending!.inputs as [Value, Value];
-      [a, b].forEach((inp, j) => {
-        if (!ownedElsewhere.has(inp)) {
-          ex.copyInto!(inp.buffer, buf, inp.shape, v.shape, j === 0 ? 0 : a.shape.elems);
-        }
-      });
-      v.setMaterialized(buf);
-    } else {
-      const slot = concatInto.get(v);
-      const out = slot !== undefined ? bufferFor(slot.holder) : ex.acquireOutput(v.shape);
-      const inputs = v.pending!.inputs.map((input) => input.buffer);
-      const addend = fusedAddend.get(v);
-      const extras: DispatchExtras | undefined =
-        addend !== undefined || slot !== undefined
-          ? {
-              addend: addend?.buffer,
-              outBase: slot?.base ?? 0,
-              outElems: slot?.holder.shape.elems,
-            }
-          : undefined;
-      ex.dispatch(v, inputs, out, extras);
-      v.setMaterialized(out);
-      if (slot !== undefined) ownedElsewhere.add(v);
-    }
-    // Dedupe: mul(x, x) would otherwise release one buffer twice.
-    // ownedElsewhere inputs belong to an alias or holder now.
-    for (const input of new Set(v.pending!.inputs)) {
-      if (
-        produced.has(input) &&
-        lastUse.get(input) === i &&
-        !targetSet.has(input) &&
-        !IN_PLACE_OPS.has(input.pending!.op) &&
-        !ownedElsewhere.has(input)
+  try {
+    order.forEach((v, i) => {
+      const aliasedConv = addAlias.get(v);
+      if (IN_PLACE_OPS.has(v.pending!.op)) {
+        // In-place op: writes rows of its first input's caller-owned buffer.
+        const out = v.pending!.inputs[0]!.buffer;
+        const inputs = v.pending!.inputs.map((input) => input.buffer);
+        ex.dispatch(v, inputs, out);
+        v.setMaterialized(out);
+      } else if (aliasedConv !== undefined) {
+        // Fused add: the conv already wrote act(conv)+x — just take its buffer.
+        v.setMaterialized(aliasedConv.buffer);
+      } else if (
+        (v.pending!.op === 'concatChannels' || v.pending!.op === 'concatChannelsHwc4') &&
+        concatInto.has(v)
       ) {
-        ex.releaseOutput(input.buffer, input.shape);
-        input.markReleased(); // any later use of this Value now fails loudly
+        // Writers targeted the holder directly; copy only what was not elided.
+        const slot = concatInto.get(v)!;
+        const buf = bufferFor(slot.holder);
+        const [a, b] = v.pending!.inputs as [Value, Value];
+        [a, b].forEach((inp, j) => {
+          if (!ownedElsewhere.has(inp)) {
+            ex.copyInto!(
+              inp.buffer,
+              buf,
+              inp.shape,
+              slot.holder.shape,
+              slot.base + (j === 0 ? 0 : a.shape.elems),
+            );
+          }
+        });
+        v.setMaterialized(buf);
+      } else if (
+        (v.pending!.op === 'concatChannels' || v.pending!.op === 'concatChannelsHwc4') &&
+        ex.copyInto &&
+        holderBuf.has(v)
+      ) {
+        // Root concat with at least one elided input.
+        const buf = bufferFor(v);
+        const [a, b] = v.pending!.inputs as [Value, Value];
+        [a, b].forEach((inp, j) => {
+          if (!ownedElsewhere.has(inp)) {
+            ex.copyInto!(inp.buffer, buf, inp.shape, v.shape, j === 0 ? 0 : a.shape.elems);
+          }
+        });
+        v.setMaterialized(buf);
+      } else {
+        const slot = concatInto.get(v);
+        const out = slot !== undefined ? bufferFor(slot.holder) : acquireOutput(v.shape);
+        const inputs = v.pending!.inputs.map((input) => input.buffer);
+        const addend = fusedAddend.get(v);
+        const extras: DispatchExtras | undefined =
+          addend !== undefined || slot !== undefined
+            ? {
+                addend: addend?.buffer,
+                outBase: slot?.base ?? 0,
+                outElems: slot?.holder.shape.elems,
+              }
+            : undefined;
+        ex.dispatch(v, inputs, out, extras);
+        v.setMaterialized(out);
+        if (slot !== undefined) ownedElsewhere.add(v);
+      }
+      // Dedupe: mul(x, x) would otherwise release one buffer twice.
+      // ownedElsewhere inputs belong to an alias/holder now.
+      for (const input of new Set(v.pending!.inputs)) {
+        if (
+          produced.has(input) &&
+          lastUse.get(input) === i &&
+          !targetSet.has(input) &&
+          !IN_PLACE_OPS.has(input.pending!.op) &&
+          !ownedElsewhere.has(input)
+        ) {
+          releaseOutput(input.buffer, input.shape);
+          input.markReleased(); // any later use of this Value now fails loudly
+        }
+      }
+    });
+    ex.submit();
+  } catch (err) {
+    ex.discard?.();
+    for (const value of order) {
+      if (value.state === 'materialized') {
+        value.markReleased('evalValues: evaluation failed before submission');
       }
     }
-  });
-  ex.submit();
+    for (const [buffer, shape] of acquired) ex.releaseOutput(buffer, shape);
+    throw err;
+  }
 }
 
 export async function toArray(value: Value, ex: Executor & Readback): Promise<Float32Array> {

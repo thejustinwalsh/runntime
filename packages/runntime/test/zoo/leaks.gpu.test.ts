@@ -116,13 +116,10 @@ const TINY_HIGGS_ENCODER = {
 const REVERB_CODEC = { ...TINY_HIGGS, codebooks: 8, codebookSize: 1024 };
 
 /** The uploads one MiniLM batch call of 5 tokens never frees, in the order
- *  they are made: the [5, 2] segments from MinilmModel.forward, the [2, 5]
- *  selector from embedPooledBatch, and the id and position lists gatherRows
- *  uploads for Embedding.forward. */
-const MINILM_BATCH_UPLOADS = [
-  ...['40 B, usage 140', '40 B, usage 140'],
-  ...['20 B, usage 140', '20 B, usage 140'],
-];
+ *  they are made: the [5, 2] segments from MinilmModel.forward and the [2, 5]
+ *  selector from embedPooledBatch. The id and position lists gatherRows
+ *  uploads for Embedding.forward go back when their submit finishes. */
+const MINILM_BATCH_UPLOADS = ['40 B, usage 140', '40 B, usage 140'];
 /** The [2, 384] embeddings toArray keeps out of the pool. */
 const MINILM_BATCH_RESULT = '3072 B, usage 140';
 

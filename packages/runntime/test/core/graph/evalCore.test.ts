@@ -55,6 +55,43 @@ function recorder(names: Record<string, Value>, { copyInto = false } = {}) {
   return { ex, log, held: () => [...held].map((buf) => bufName.get(buf)) };
 }
 
+describe('evalValues after a failed dispatch', () => {
+  /** x → a → b with the second dispatch throwing. */
+  function failing() {
+    const x = materializedInput([2, 3]);
+    const a = add(x, 1);
+    const b = tanh(a);
+    const { ex, log, held } = recorder({ x, a, b });
+    const discard = vi.fn();
+    let dispatches = 0;
+    const failingEx: Executor = {
+      ...ex,
+      discard,
+      dispatch: (...args) => {
+        if (++dispatches === 2) throw new Error('boom');
+        ex.dispatch(...args);
+      },
+    };
+    return { x, a, b, ex, failingEx, discard, log, held };
+  }
+
+  it('rethrows, discards the queued work and frees every buffer it acquired', () => {
+    const { b, failingEx, discard, log, held } = failing();
+    expect(() => evalValues([b], failingEx)).toThrow('boom');
+    expect(discard).toHaveBeenCalledOnce();
+    expect(log).toEqual(['a → #0', 'release #0', 'release #1']);
+    expect(held()).toEqual([]);
+    expect(b.state).toBe('pending');
+  });
+
+  it('marks the values it computed as released, so a retry fails loudly', () => {
+    const { a, b, failingEx, ex } = failing();
+    expect(() => evalValues([b], failingEx)).toThrow('boom');
+    expect(a.state).toBe('released');
+    expect(() => evalValues([b], ex)).toThrow('evaluation failed before submission');
+  });
+});
+
 describe('evalValues', () => {
   it('dispatches each node once, after its inputs, and frees it after its last reader', () => {
     const x = materializedInput([2, 3]);
