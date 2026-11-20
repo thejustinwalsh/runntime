@@ -355,6 +355,8 @@ export type FloatTensor = FileTensor | DerivedTensor;
 
 export interface LazyStateDict {
   metadata: Record<string, string>;
+  /** Typed GGUF metadata is distinct from safetensors string metadata. */
+  ggufMetadata?: Record<string, unknown>;
   tensors: Map<string, LazyTensor>;
   totalBytes(): number;
 }
