@@ -109,10 +109,13 @@ declare global {
 }
 
 const MODE = import.meta.env.VITE_LFM3_QUALIFICATION_MODE;
-const ENGINE_URL = import.meta.env.VITE_LFM3_LIQUID_ENGINE_URL;
-const MODEL_URL = import.meta.env.VITE_LFM3_LIQUID_MODEL_URL;
-const PROJECTOR_URL = import.meta.env.VITE_LFM3_LIQUID_PROJECTOR_URL;
-const AUDIO_INPUT_BASE_URL = import.meta.env.VITE_LFM3_LIQUID_AUDIO_INPUT_BASE_URL;
+// The engine resolves a bare path against the model's directory, so every URL is made absolute.
+const absolute = (url: string | undefined): string | undefined =>
+  url === undefined ? undefined : new URL(url, location.href).href;
+const ENGINE_URL = absolute(import.meta.env.VITE_LFM3_LIQUID_ENGINE_URL);
+const MODEL_URL = absolute(import.meta.env.VITE_LFM3_LIQUID_MODEL_URL);
+const PROJECTOR_URL = absolute(import.meta.env.VITE_LFM3_LIQUID_PROJECTOR_URL);
+const AUDIO_INPUT_BASE_URL = absolute(import.meta.env.VITE_LFM3_LIQUID_AUDIO_INPUT_BASE_URL);
 const TTS_SYSTEM_PROMPT = 'Perform TTS in American English using a female voice.';
 const REQUESTED_TEXT = 'The quick brown fox jumps over the lazy dog.';
 const REVEAL_SIZES = [4, 4, 4] as const;
