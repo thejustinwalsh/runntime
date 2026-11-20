@@ -183,6 +183,7 @@ for (const mode of modes) {
               : 'audio-reference',
         VITE_LFM3_AUDIO_INPUT_BASE_URL: '/test/.weights/audio-fixtures',
         VITE_LFM3_LIQUID_AUDIO_CAPTURE: '1',
+        VITE_LFM3_LIQUID_SKIP_SPEECH_RETENTION: '1',
         VITE_LFM3_LIQUID_ENGINE_URL: `/test/.weights/${LIQUID_ENGINE.instrumentedFile}`,
         VITE_LFM3_LIQUID_MODEL_URL: `/test/.weights/${WEIGHTS.model}`,
         VITE_LFM3_LIQUID_PROJECTOR_URL: `/test/.weights/${WEIGHTS.projector}`,

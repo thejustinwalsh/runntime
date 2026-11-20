@@ -99,6 +99,7 @@ declare global {
     readonly VITE_LFM3_LIQUID_PROJECTOR_URL?: string;
     readonly VITE_LFM3_LIQUID_AUDIO_INPUT_BASE_URL?: string;
     readonly VITE_LFM3_LIQUID_AUDIO_CAPTURE?: string;
+    readonly VITE_LFM3_LIQUID_SKIP_SPEECH_RETENTION?: string;
     readonly VITE_LFM3_LIQUID_LEVEL_DIAGNOSTIC?: string;
     readonly VITE_LFM3_NATIVE_SPEECH_URL?: string;
   }
@@ -116,6 +117,8 @@ const LIQUID_MODEL_URL = absolute(import.meta.env.VITE_LFM3_LIQUID_MODEL_URL);
 const LIQUID_PROJECTOR_URL = absolute(import.meta.env.VITE_LFM3_LIQUID_PROJECTOR_URL);
 const AUDIO_INPUT_BASE_URL = absolute(import.meta.env.VITE_LFM3_LIQUID_AUDIO_INPUT_BASE_URL);
 const AUDIO_CAPTURE = import.meta.env.VITE_LFM3_LIQUID_AUDIO_CAPTURE === '1';
+// The packed consumer retains generated speech through its capture middleware; a plain run has none.
+const RETAIN_SPEECH = import.meta.env.VITE_LFM3_LIQUID_SKIP_SPEECH_RETENTION !== '1';
 const LEVEL_DIAGNOSTIC = import.meta.env.VITE_LFM3_LIQUID_LEVEL_DIAGNOSTIC === '1';
 const NATIVE_SPEECH_URL = import.meta.env.VITE_LFM3_NATIVE_SPEECH_URL;
 const ENGINE_REVISION = '9c2fb176f4c222da394e8037d3c0d0837f70b978';
@@ -469,13 +472,15 @@ async function captureAudioReferences(
     const speechBytes = encodeFloat32Wav(speechSamples, speechSampleRate);
     const speechDigest = await sha256(speechBytes);
     const speechFilename = `liquid-speech-${testCase.id}.wav`;
-    const saved = await fetch(`/__liquid-audio-output/${speechFilename}`, {
-      method: 'POST',
-      headers: { 'content-type': 'audio/wav' },
-      body: speechBytes,
-    });
-    if (saved.status !== 204)
-      throw new Error(`failed to save Liquid speech fixture: HTTP ${saved.status}`);
+    if (RETAIN_SPEECH) {
+      const saved = await fetch(`/__liquid-audio-output/${speechFilename}`, {
+        method: 'POST',
+        headers: { 'content-type': 'audio/wav' },
+        body: speechBytes,
+      });
+      if (saved.status !== 204)
+        throw new Error(`failed to save Liquid speech fixture: HTTP ${saved.status}`);
+    }
 
     const speechTranscriptionSamples = await resampleAudio(speechSamples, speechSampleRate);
     const speechTranscription = await streamLiquidTokens(audioModel, reference, {
