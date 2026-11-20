@@ -133,6 +133,7 @@ from `models`, or spread one and change a field.
 
 | Task                  | Factory                   | Models                                |
 | --------------------- | ------------------------- | ------------------------------------- |
+| Chat                  | `createLfm3Chat`          | Liquid LFM3-Omni 2B (BF16 and Q4_K_M) |
 | Embedding             | `createEmbedder`          | EmbeddingGemma 2, all-MiniLM-L6-v2    |
 | Privacy filter        | `createPrivacyFilter`     | OpenAI privacy-filter (int8)          |
 | Speech to text        | `createSpeechToText`      | Moonshine tiny / base, streaming tiny |

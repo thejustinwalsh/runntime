@@ -149,6 +149,7 @@ export default defineConfig({
                     { label: 'Text to speech', slug: 'zoo/text-to-speech' },
                     { label: 'Privacy filter', slug: 'zoo/privacy-filter' },
                     { label: 'D1 decision model', slug: 'zoo/d1' },
+                    { label: 'LFM3 chat', slug: 'zoo/lfm3-chat' },
                     { label: 'Object detection', slug: 'zoo/object-detection' },
                     { label: 'Instance segmentation', slug: 'zoo/instance-segmentation' },
                     { label: 'Pose & keypoints', slug: 'zoo/pose-and-keypoints' },
@@ -180,7 +181,7 @@ export default defineConfig({
             // unlisted until runntime core is published.
             exclude: ['/', '/core/**'],
             // The generated index pages sit outside the sidebar groups.
-            topics: { zoo: ['/api/**'] },
+            topics: { zoo: ['/api/**', '/zoo/lfm3-audio'] },
           },
         ),
         // Run after the topics: they fill the placeholder groups under

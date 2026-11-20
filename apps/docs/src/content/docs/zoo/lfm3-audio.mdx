@@ -1,0 +1,59 @@
+---
+title: LFM3 audio
+description: Transcribe 16 kHz audio and stream 24 kHz speech with Liquid's published LFM3-Omni-2B pair on WebGPU.
+---
+
+`createLfm3Audio` loads the exact published Q4_K_M language GGUF and matching
+Q8_0 audio-projector GGUF, verifies both complete file hashes, and returns
+transcription and speech-generation methods. It uses the native TypeGPU
+implementation and the initialized WebGPU device; it does not substitute an
+ASR model or codec. The audio encoder requires WebGPU's `shader-f16` feature;
+initialize ruNNtime with that optional device feature before loading.
+
+```ts twoslash
+import tgpu from 'typegpu';
+import { createLfm3Audio, initRunntime, models } from 'runntime/zoo';
+
+// Provided by the host as mono Float32 PCM sampled at 16 kHz.
+declare const audio16k: Float32Array;
+
+initRunntime(await tgpu.init({ device: { optionalFeatures: ['subgroups', 'shader-f16'] } }));
+// ---cut---
+const omni = await createLfm3Audio(models.lfm3.LFM3_OMNI_2B.Q4_K_M);
+
+// Mono Float32 PCM sampled at 16 kHz; each clip is limited to 32 seconds.
+const transcript = await omni.transcribe(audio16k);
+console.log(transcript);
+
+// Speech chunks are mono Float32 PCM at 24 kHz.
+const speech = omni.speak('Hello from LFM3-Omni.', { seed: 7 });
+const chunks: Float32Array[] = [];
+for await (const samples of speech) {
+  chunks.push(samples);
+}
+const result = await speech.result;
+console.log(result.sampleRate, result.audioFrames, result.finishReason);
+console.log(chunks.length);
+
+await omni.dispose();
+```
+
+Speech is streamed by codec frame. `maxAudioFrames` bounds generation (256 by
+default, 1024 maximum); `depthPasses` controls MaskGIT refinement (three by
+default), and `seed` makes sampling reproducible. Each speech request can also
+be cancelled with its `signal` or the generation's `cancel()` method. Loading
+supports the usual range-source, cache, progress, abort and warm-up options.
+
+The source files are pinned to
+[`LiquidAI/LFM3-Omni-2B-GGUF`](https://huggingface.co/LiquidAI/LFM3-Omni-2B-GGUF/tree/3d29af2ad166f8299c2d820937e47dc0add20ffc):
+the language file is
+[`LFM3-Omni-2B-Q4_K_M.gguf`](https://huggingface.co/LiquidAI/LFM3-Omni-2B-GGUF/blob/3d29af2ad166f8299c2d820937e47dc0add20ffc/LFM3-Omni-2B-Q4_K_M.gguf)
+and the audio projector is
+[`mmproj-LFM3-Omni-2B-Q8_0.gguf`](https://huggingface.co/LiquidAI/LFM3-Omni-2B-GGUF/blob/3d29af2ad166f8299c2d820937e47dc0add20ffc/mmproj-LFM3-Omni-2B-Q8_0.gguf).
+Both files are © Liquid AI, Inc. and licensed under the
+[LFM Open License v1.0](https://huggingface.co/LiquidAI/LFM3-Omni-2B-GGUF/blob/3d29af2ad166f8299c2d820937e47dc0add20ffc/LICENSE).
+Commercial use is limited to legal entities under the license's annual-revenue
+threshold of $10 million; the license also has a qualified non-profit exception
+for non-commercial or research use. Review the complete license for terms. The
+package's MIT license covers runtime code, not model weights. ruNNtime fetches
+the weights from Hugging Face and does not redistribute them.
