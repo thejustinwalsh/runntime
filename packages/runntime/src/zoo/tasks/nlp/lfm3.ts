@@ -59,8 +59,7 @@ export type {
 } from '../../lfm3/session.ts';
 export type { Lfm3Message } from '../../lfm3/tokenizer.ts';
 
-/** A loaded LFM3 language backbone: tokenizer, one forward step over a cache
- *  and the embedding lookup, held by a task runner. */
+/** Resources shared by public LFM3 language and audio runners. */
 export interface Lfm3Backbone {
   readonly root: TgpuRoot;
   readonly executor: RunntimeExecutor;

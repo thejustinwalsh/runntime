@@ -52,6 +52,15 @@ export {
   type Lfm3GenerationResult,
   type Lfm3Message,
 } from './tasks/nlp/lfm3.ts';
+export {
+  createLfm3Audio,
+  type Lfm3Audio,
+  type Lfm3AudioModel,
+  type Lfm3SpeechGeneration,
+  type Lfm3SpeechOptions,
+  type Lfm3SpeechResult,
+  type Lfm3TranscriptionOptions,
+} from './tasks/audio/lfm3.ts';
 
 export {
   createSpeechToText,
