@@ -9,12 +9,14 @@ import {
   inGpuErrorScopes,
   isRunntimeError,
   RunntimeError,
+  tensor,
   toArray,
   warmUp,
   type RangeSource,
   type RunntimeExecutor,
   type Value,
 } from '../../../core/index.ts';
+import { readGgufEmbeddingRows, type GgufStateDict } from '../../../core/weights/gguf.ts';
 import type { TgpuRoot } from 'typegpu';
 import { asLoadError, rethrowRunError } from '../../errors.ts';
 import {
@@ -26,7 +28,13 @@ import {
 } from '../../load.ts';
 import { models } from '../../models.ts';
 import { LFM3_Q4_K_M_SOURCE } from '../../lfm3/gguf.ts';
-import { cacheValues, Lfm3CausalLM, type Lfm3Cache, type Lfm3ModelStep } from '../../lfm3/model.ts';
+import {
+  cacheValues,
+  LFM3,
+  Lfm3CausalLM,
+  type Lfm3Cache,
+  type Lfm3ModelStep,
+} from '../../lfm3/model.ts';
 import {
   createLfm3Session,
   type Lfm3ChatSession,
@@ -77,7 +85,7 @@ export interface Lfm3Backbone {
     previous: Lfm3Cache | undefined,
     signal: AbortSignal,
   ): Promise<{ logits: Float32Array; hidden: Float32Array; cache: Lfm3Cache }>;
-  embedTokens(ids: readonly number[], uploads: Value[]): Value;
+  embedTokens(ids: readonly number[], uploads: Value[], signal: AbortSignal): Promise<Value>;
 }
 
 /** Loads the pinned LFM3 language backbone for a composed task runner. */
@@ -90,7 +98,22 @@ export async function loadLfm3Backbone(
   const tokenizerPath = config.tokenizerPath ?? LFM3_TOKENIZER_URL;
   const root = defaultRoot();
   const executor = gpuExecutor(root);
-  const model = new Lfm3CausalLM();
+  let gguf: GgufStateDict | undefined;
+  const table = 'token_embd.weight';
+  const model = new Lfm3CausalLM(
+    config.format === 'gguf' ? (start, count) => gguf!.rows(table, start, count) : undefined,
+  );
+  const embedTokens = async (ids: readonly number[], uploads: Value[], signal: AbortSignal) => {
+    const embeddings = gguf
+      ? tensor(root, await readGgufEmbeddingRows(gguf, table, LFM3.hidden, ids, signal), {
+          dims: [ids.length, LFM3.hidden],
+          elems: ids.length * LFM3.hidden,
+          dtype: 'f32',
+        })
+      : model.model.embed_tokens!.forward(ids, root);
+    uploads.push(embeddings);
+    return embeddings;
+  };
   const releaseAfterWork = async (): Promise<void> => {
     try {
       await root.device.queue.onSubmittedWorkDone();
@@ -99,7 +122,7 @@ export async function loadLfm3Backbone(
     }
   };
   const runStep = async (
-    create: (uploads: Value[]) => Lfm3ModelStep,
+    create: (uploads: Value[]) => Lfm3ModelStep | Promise<Lfm3ModelStep>,
     previous: Lfm3Cache | undefined,
     signal: AbortSignal,
     uploads: Value[],
@@ -113,7 +136,7 @@ export async function loadLfm3Backbone(
         });
       }
       const result = await inGpuErrorScopes(root.device, 'LFM3 generation', async () => {
-        const current = create(uploads);
+        const current = await create(uploads);
         step = current;
         // Readbacks stay unfused: the logits (and hidden) copy runs after the
         // eval's own submit. Queuing a fused readback before evalValues leaves
@@ -168,7 +191,8 @@ export async function loadLfm3Backbone(
   const runtime: Lfm3SessionRuntime<Lfm3Cache> = {
     async forward(ids: readonly number[], previous: Lfm3Cache | undefined, signal: AbortSignal) {
       return runStep(
-        (uploads) => model.forward(ids, root, previous, uploads),
+        async (uploads) =>
+          model.forwardEmbeddings(await embedTokens(ids, uploads, signal), root, previous, uploads),
         previous,
         signal,
         [],
@@ -196,7 +220,7 @@ export async function loadLfm3Backbone(
     throwIfAborted(opts.signal);
     const weights =
       config.format === 'gguf'
-        ? await openGgufWeights(modelPath, opts)
+        ? (gguf = await openGgufWeights(modelPath, opts))
         : await openWeights(modelPath, {
             ...opts,
             cacheId: opts.cacheId ?? cacheKey(modelPath),
@@ -216,6 +240,7 @@ export async function loadLfm3Backbone(
         throwIfAborted(opts.signal);
       },
     });
+    if (gguf) gguf.tensors.clear();
     throwIfAborted(opts.signal);
 
     if (opts.warmUp !== false) {
@@ -265,7 +290,13 @@ export async function loadLfm3Backbone(
       },
       async forwardTokens(ids, previous, signal) {
         const result = await runStep(
-          (uploads) => model.forward(ids, root, previous, uploads),
+          async (uploads) =>
+            model.forwardEmbeddings(
+              await embedTokens(ids, uploads, signal),
+              root,
+              previous,
+              uploads,
+            ),
           previous,
           signal,
           [],
@@ -276,11 +307,7 @@ export async function loadLfm3Backbone(
         }
         return { logits: result.logits, hidden: result.hidden, cache: result.cache };
       },
-      embedTokens(ids, uploads) {
-        const embeddings = model.model.embed_tokens.forward(ids, root);
-        uploads.push(embeddings);
-        return embeddings;
-      },
+      embedTokens,
     };
   } catch (error) {
     try {

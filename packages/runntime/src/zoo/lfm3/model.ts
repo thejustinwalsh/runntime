@@ -436,7 +436,13 @@ class Lfm3LanguageModel extends nn.Module<
   [Value, number, number, Lfm3Cache | undefined, TgpuRoot, Value[]],
   { hidden: Value; cache: Lfm3Cache }
 > {
-  readonly embed_tokens = new nn.Embedding(LFM3.vocab, LFM3.hidden, { device: 'cpu' });
+  readonly embed_tokens?: nn.Embedding;
+
+  constructor(diskEmbeddings: boolean) {
+    super();
+    if (!diskEmbeddings)
+      this.embed_tokens = new nn.Embedding(LFM3.vocab, LFM3.hidden, { device: 'cpu' });
+  }
   readonly layers = new nn.ModuleList(
     Array.from({ length: LFM3.layers }, (_, layer) => new Lfm3Layer(layer)),
   );
@@ -497,6 +503,10 @@ class Lfm3LmHead extends nn.Module<[Value], Value> {
     ),
   );
 
+  constructor(private readonly readRows?: (start: number, count: number) => LazyTensor) {
+    super();
+  }
+
   override transformStateDict(sd: LazyStateDict, prefix: string): void {
     const name = `${prefix}.weight`;
     const weight = sd.tensors.get(name);
@@ -507,7 +517,12 @@ class Lfm3LmHead extends nn.Module<[Value], Value> {
         `has shape [${weight.shape.join(', ')}], expected [${LFM3.vocab}, ${LFM3.hidden}]`,
       );
     }
-    const shards = splitRows(weight, Array(LM_HEAD_SHARDS).fill(LM_HEAD_SHARD_ROWS));
+    const readRows = this.readRows;
+    const shards = readRows
+      ? Array.from({ length: LM_HEAD_SHARDS }, (_, i) =>
+          readRows(i * LM_HEAD_SHARD_ROWS, LM_HEAD_SHARD_ROWS),
+        )
+      : splitRows(weight, Array(LM_HEAD_SHARDS).fill(LM_HEAD_SHARD_ROWS));
     sd.tensors.delete(name);
     shards.forEach((shard, index) => {
       sd.tensors.set(`${prefix}.projections.${index}.weight`, shard);
@@ -540,8 +555,14 @@ export class Lfm3CausalLM extends nn.Module<
   [readonly number[], TgpuRoot, Lfm3Cache?],
   Lfm3ModelStep
 > {
-  readonly model = new Lfm3LanguageModel();
-  readonly lm_head = new Lfm3LmHead();
+  readonly model: Lfm3LanguageModel;
+  readonly lm_head: Lfm3LmHead;
+
+  constructor(readEmbeddingRows?: (start: number, count: number) => LazyTensor) {
+    super();
+    this.model = new Lfm3LanguageModel(Boolean(readEmbeddingRows));
+    this.lm_head = new Lfm3LmHead(readEmbeddingRows);
+  }
 
   override transformStateDict(sd: LazyStateDict): void {
     if (sd.ggufMetadata) mapGgufStateDict(sd);
@@ -553,7 +574,10 @@ export class Lfm3CausalLM extends nn.Module<
     for (const [sourceName, sourceTensor] of language) {
       const name = sourceName.slice(prefix.length);
       let tensor = sourceTensor;
-      if (name === 'embed_tokens.weight') embedding = tensor;
+      if (name === 'embed_tokens.weight') {
+        embedding = tensor;
+        if (!this.model.embed_tokens) continue;
+      }
       if (name.endsWith('.self_attn.q_proj.weight')) tensor = permuteRows(tensor, Q_ORDER);
       else if (name.endsWith('.self_attn.k_proj.weight')) tensor = permuteRows(tensor, K_ORDER);
       else if (
@@ -606,6 +630,11 @@ export class Lfm3CausalLM extends nn.Module<
       );
     }
     const uploads = ownedUploads;
+    if (!this.model.embed_tokens)
+      throw new RunntimeError(
+        'INVALID_ARGUMENT',
+        'Use forwardEmbeddings with a disk-backed LFM3 table',
+      );
     const embedding = track(this.model.embed_tokens.forward(ids, root), uploads);
     return this.forwardEmbeddings(embedding, root, previous, uploads);
   }

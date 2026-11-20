@@ -11,7 +11,7 @@ it('exposes every upload to its caller when graph construction throws', async ()
   const before = liveBuffers();
   const model = new Lfm3CausalLM();
   const embedding = tensor(root, new Float32Array(LFM3.hidden), matrix(1, LFM3.hidden));
-  model.model.embed_tokens.forward = () => embedding;
+  model.model.embed_tokens!.forward = () => embedding;
   model.model.layers.items[0]!.forward = () => {
     throw new Error('injected synchronous graph failure');
   };

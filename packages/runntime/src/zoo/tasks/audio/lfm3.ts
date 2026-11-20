@@ -266,7 +266,7 @@ export async function createLfm3Audio(
       return run.catch(rethrowRunError);
     };
 
-    const encodeAudioPrompt = (audio: Float32Array) => {
+    const encodeAudioPrompt = async (audio: Float32Array, signal: AbortSignal) => {
       validateAudio(audio);
       const uploads: Value[] = [];
       try {
@@ -296,10 +296,12 @@ export async function createLfm3Audio(
           ...prompt.slice(at + 1),
         ];
         const parts: Value[] = [];
-        if (at > 0) parts.push(liveBackbone.embedTokens(ids.slice(0, at), uploads));
+        if (at > 0) parts.push(await liveBackbone.embedTokens(ids.slice(0, at), uploads, signal));
         parts.push(features);
         if (prompt.length - at - 1 > 0) {
-          parts.push(liveBackbone.embedTokens(ids.slice(at + expectedTokens), uploads));
+          parts.push(
+            await liveBackbone.embedTokens(ids.slice(at + expectedTokens), uploads, signal),
+          );
         }
         return {
           ids,
@@ -318,7 +320,7 @@ export async function createLfm3Audio(
       signal: AbortSignal,
     ): Promise<string> => {
       const maxNewTokens = validateTranscriptionLimit(options.maxNewTokens);
-      const prompt = encodeAudioPrompt(audio);
+      const prompt = await encodeAudioPrompt(audio, signal);
       let uploadsHandedOff = false;
       let cache: Awaited<ReturnType<Lfm3Backbone['forwardTokens']>>['cache'] | undefined;
       try {
@@ -429,7 +431,7 @@ export async function createLfm3Audio(
 
     const warmAudioPaths = async (): Promise<Float32Array> => {
       const warmSignal = opts.signal ?? new AbortController().signal;
-      const encoded = encodeAudioPrompt(new Float32Array(LFM3_AUDIO_SAMPLE_RATE));
+      const encoded = await encodeAudioPrompt(new Float32Array(LFM3_AUDIO_SAMPLE_RATE), warmSignal);
       let transcriptionCache:
         Awaited<ReturnType<Lfm3Backbone['forwardTokens']>>['cache'] | undefined;
       let speechCache: Awaited<ReturnType<Lfm3Backbone['forwardTokens']>>['cache'] | undefined;

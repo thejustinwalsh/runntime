@@ -586,9 +586,62 @@ function abortIfNeeded(signal?: AbortSignal): void {
   }
 }
 
+/** A GGUF state dict that can also read a row range of one 2-D tensor. */
+export interface GgufStateDict extends LazyStateDict {
+  /** Tensor `name` restricted to `count` rows from row `start`, reading only
+   *  those bytes. Throws INVALID_ARGUMENT for an unknown or non-2-D tensor or a
+   *  range outside it. */
+  rows(name: string, start: number, count: number): ReturnType<typeof ggufTensor>;
+}
+
+/** Decodes the rows `ids` of the `width`-wide embedding table `name` to f32
+ *  `[ids.length, width]`, reading each distinct row once and keeping no decoded
+ *  table. Rejects with `signal.reason` once `signal` aborts. */
+export async function readGgufEmbeddingRows(
+  file: GgufStateDict,
+  name: string,
+  width: number,
+  ids: readonly number[],
+  signal: AbortSignal,
+): Promise<Float32Array> {
+  const output = new Float32Array(ids.length * width);
+  const positions = new Map<number, number[]>();
+  ids.forEach((id, index) => {
+    const repeats = positions.get(id) ?? [];
+    repeats.push(index);
+    positions.set(id, repeats);
+  });
+  const entries = [...positions];
+  // Bound concurrent IPC reads without serializing prompt lookups.
+  for (let start = 0; start < entries.length; start += 16) {
+    await Promise.all(
+      entries.slice(start, start + 16).map(async ([id, repeats]) => {
+        signal.throwIfAborted();
+        const row = file.rows(name, id, 1);
+        const values =
+          row.kind === 'quant'
+            ? await (async () => {
+                const ints = await row.ints();
+                const scales = await row.scales();
+                const offsets = await row.offsets?.();
+                return Float32Array.from(ints, (value, col) => {
+                  const group = Math.floor(col / row.groupSize);
+                  return value * scales[group]! + (offsets?.[group] ?? 0);
+                });
+              })()
+            : await row.f32();
+        signal.throwIfAborted();
+        for (const index of repeats) output.set(values, index * width);
+      }),
+    );
+  }
+  return output;
+}
+
 /** Loads a GGUF v3 file as a lazy state dict: F16 and F32 tensors read as
  *  floats, Q4_K, Q6_K and Q8_0 as quantized tensors, nothing read until a
- *  tensor is used. The typed header metadata is `ggufMetadata`.
+ *  tensor is used. The typed header metadata is `ggufMetadata`, and `rows`
+ *  reads single rows of a 2-D tensor.
  *
  *  The whole file is read once and hashed first. `fileBytes` is its exact size
  *  and `sha256` the expected digest, 64 lowercase hex digits. `cache` stores
@@ -606,7 +659,7 @@ export async function fromGguf(
     cacheId?: string;
     signal?: AbortSignal;
   },
-): Promise<LazyStateDict> {
+): Promise<GgufStateDict> {
   if (!Number.isSafeInteger(opts.fileBytes) || opts.fileBytes < 24) {
     throw new RunntimeError(
       'INVALID_ARGUMENT',
@@ -656,6 +709,24 @@ export async function fromGguf(
   return {
     metadata: {},
     ggufMetadata: index.metadata,
+    rows(name, start, count) {
+      const info = index.tensors.get(name);
+      if (
+        !info ||
+        info.shape.length !== 2 ||
+        !Number.isSafeInteger(start) ||
+        !Number.isSafeInteger(count) ||
+        start < 0 ||
+        count < 1 ||
+        start + count > info.shape[0]!
+      ) {
+        throw new RunntimeError('INVALID_ARGUMENT', `Invalid GGUF row range for ${name}`);
+      }
+      const shape = [count, info.shape[1]!];
+      const rowBytes = tensorBytes(info.type, [info.shape[1]!]);
+      const begin = info.begin + start * rowBytes;
+      return ggufTensor({ ...info, shape, begin, end: begin + count * rowBytes }, cached);
+    },
     tensors,
     totalBytes: () => [...tensors.values()].reduce((sum, tensor) => sum + tensor.byteLength, 0),
   };
