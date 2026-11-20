@@ -66,24 +66,47 @@ export class Parameter {
 
 /** A Parameter that stays in CPU memory, for weights where forward() reads only
  *  a few rows. BF16 keeps its raw bits. */
+export interface CpuQuantizedData {
+  readonly ints: Int8Array;
+  readonly scales: Float32Array | Uint16Array;
+  readonly offsets?: Float32Array | Uint16Array;
+  readonly groupSize: number;
+}
+
 export class CpuParameter extends Parameter {
   private _data: Float32Array | Uint16Array | undefined;
+  private _quantizedData: CpuQuantizedData | undefined;
   override get value(): Value {
     throw new Error(
       `Parameter ${this.qualifiedName || '(unnamed)'} is CPU-resident — read .data, it has no GPU Value`,
     );
   }
   get data(): Float32Array | Uint16Array {
+    if (this._quantizedData) {
+      throw new Error(
+        `Parameter ${this.qualifiedName || '(unnamed)'} is quantized — read .quantizedData`,
+      );
+    }
     if (!this._data) throw new Error(`Parameter ${this.qualifiedName || '(unnamed)'} not loaded`);
     return this._data;
+  }
+  get quantizedData(): CpuQuantizedData | undefined {
+    return this._quantizedData;
   }
   /** @internal */
   bindData(data: Float32Array | Uint16Array): void {
     this._data = data;
+    this._quantizedData = undefined;
+  }
+  /** @internal */
+  bindQuantizedData(data: CpuQuantizedData): void {
+    this._data = undefined;
+    this._quantizedData = data;
   }
   /** Drops the CPU data. */
   override dispose(): void {
     this._data = undefined;
+    this._quantizedData = undefined;
   }
 }
 

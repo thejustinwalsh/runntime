@@ -1,6 +1,7 @@
 /** Stock nn layers: each holds Parameters and calls the matching op. */
 
 import { RunntimeError } from '../error.ts';
+import type { TgpuRoot } from 'typegpu';
 import { groupNorm, linear } from '../graph/compose.ts';
 import {
   type ConvAct,
@@ -43,6 +44,7 @@ import {
 } from '../weights/safetensors.ts';
 import { dequantize, floatTensor, readFloats, transposeWeight } from '../weights/transforms.ts';
 import { tensor } from '../gpu/buffers.ts';
+import { defaultRoot } from '../gpu/context.ts';
 import { CpuParameter, Module, Parameter, type AnyModule } from './module.ts';
 
 /** Token-id lookup table: ids to rows of a [numEmbeddings, dims] weight.
@@ -51,8 +53,9 @@ import { CpuParameter, Module, Parameter, type AnyModule } from './module.ts';
  *  in its raw orientation. On 'cpu' it never reaches the GPU — forward()
  *  gathers the requested rows and uploads those — and tying is unavailable.
  *
- *  A quantized checkpoint weight loads as its dequantized floats. */
-export class Embedding extends Module<[readonly number[] | Value], Value> {
+ *  A quantized checkpoint weight loads as its dequantized floats on 'gpu'; a
+ *  'cpu' table keeps it quantized and dequantizes the gathered rows. */
+export class Embedding extends Module<[readonly number[] | Value, TgpuRoot?], Value> {
   readonly weight: Parameter;
   constructor(
     readonly numEmbeddings: number,
@@ -72,7 +75,9 @@ export class Embedding extends Module<[readonly number[] | Value], Value> {
   override transformStateDict(sd: LazyStateDict, prefix: string): void {
     const name = prefix ? `${prefix}.weight` : 'weight';
     const t = sd.tensors.get(name);
-    if (t?.kind === 'quant') sd.tensors.set(name, dequantize(t));
+    if (t?.kind === 'quant' && !(this.weight instanceof CpuParameter)) {
+      sd.tensors.set(name, dequantize(t));
+    }
   }
   /** CPU gather of the requested rows. cpu tables only. */
   gather(tokenIds: readonly number[]): Float32Array {
@@ -80,29 +85,51 @@ export class Embedding extends Module<[readonly number[] | Value], Value> {
       throw new Error('Embedding.gather: cpu-resident tables only');
     }
     const { numEmbeddings: vocab, embeddingDim: dim } = this;
-    const table = this.weight.data;
+    const quantized = this.weight.quantizedData;
+    const table = quantized ? undefined : this.weight.data;
     const out = new Float32Array(tokenIds.length * dim);
     const u32 = new Uint32Array(out.buffer);
+    const quantScales = quantized
+      ? quantized.scales instanceof Float32Array
+        ? quantized.scales
+        : f16ToF32(quantized.scales)
+      : undefined;
+    const quantOffsets = quantized?.offsets
+      ? quantized.offsets instanceof Float32Array
+        ? quantized.offsets
+        : f16ToF32(quantized.offsets)
+      : undefined;
     tokenIds.forEach((id, t) => {
       if (!Number.isInteger(id) || id < 0 || id >= vocab) {
         throw new Error(`Embedding: token id ${id} out of range (vocab ${vocab})`);
       }
       const base = id * dim;
-      if (table instanceof Float32Array) {
+      if (quantized) {
+        if (!quantScales) throw new Error('Embedding.gather: invalid quantized table');
+        for (let i = 0; i < dim; i++) {
+          const group = Math.floor(i / quantized.groupSize);
+          const index = id * (dim / quantized.groupSize) + group;
+          out[t * dim + i] =
+            quantized.ints[base + i]! * quantScales[index]! + (quantOffsets?.[index] ?? 0);
+        }
+      } else if (table instanceof Float32Array) {
         out.set(table.subarray(base, base + dim), t * dim);
-      } else {
+      } else if (table instanceof Uint16Array) {
         for (let i = 0; i < dim; i++) u32[t * dim + i] = table[base + i]! << 16;
+      } else {
+        throw new Error('Embedding.gather: table is not loaded');
       }
     });
     return out;
   }
   /** Token ids to embedded rows [t, dims], always f32. A GPU-resident id
    *  vector lets a captured graph re-run on new tokens; cpu tables take the
-   *  array form only. */
-  forward(ids: readonly number[] | Value): Value {
+   *  array form only and upload the gathered rows to `root`, the default root
+   *  when omitted. */
+  forward(ids: readonly number[] | Value, root?: TgpuRoot): Value {
     if (Array.isArray(ids)) {
       return this.weight instanceof CpuParameter
-        ? tensor(this.gather(ids), {
+        ? tensor(root ?? defaultRoot(), this.gather(ids), {
             elems: ids.length * this.embeddingDim,
             dtype: this.weight.shape.dtype,
             dims: [ids.length, this.embeddingDim],

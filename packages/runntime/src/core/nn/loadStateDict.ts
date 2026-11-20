@@ -183,36 +183,51 @@ async function bindStateDict(
   let done = 0;
   for (const [name, p] of params) {
     const t = sd.tensors.get(name)!;
-    // Linear's and the convs' hooks turn a quantized weight into quantW
-    // words, so a QuantTensor still here is bound to something else.
     if (t.kind === 'quant') {
-      throw new RunntimeError(
-        'CHECKPOINT_MISMATCH',
-        `loadStateDict: '${name}' is quantized (int${t.bits}), but only a Linear, Conv1d or ` +
-          `ConvTranspose1d weight loads quantized and this parameter holds ${p.shape.dtype}`,
-      );
-    }
-    const numel = t.shape.reduce((a, b) => a * b, 1);
-    // A quantW slot counts u32 words under logical dims. Privacy-filter's
-    // pre-packed U32 file tensors count words too; anything else, like
-    // Linear's packed weight, counts logical values.
-    const words = p.shape.dtype === 'quantW' && t.kind === 'file' && t.dtype === 'U32';
-    const expected =
-      p.shape.dtype === 'quantW' && !words
-        ? p.shape.dims!.reduce((a, b) => a * b, 1)
-        : p.shape.elems;
-    if (numel !== expected) {
-      throw new RunntimeError(
-        'CHECKPOINT_MISMATCH',
-        `loadStateDict: '${name}' checkpoint shape [${t.shape}] (${numel} elems) != model ${JSON.stringify(p.shape.dims)} (${expected} ${words ? 'words' : 'elems'})`,
-      );
-    }
-    if (p instanceof CpuParameter) {
-      // CPU-resident. BF16 keeps its raw bits; anything else converts to f32.
-      p.bindData(t.dtype === 'BF16' ? await t.u16() : await t.f32());
+      // Linear's and the convs' hooks turn a quantized weight into quantW
+      // words, so a QuantTensor still here binds only to a cpu parameter.
+      if (!(p instanceof CpuParameter)) {
+        throw new RunntimeError(
+          'CHECKPOINT_MISMATCH',
+          `loadStateDict: '${name}' is quantized (int${t.bits}), but only a Linear, Conv1d or ` +
+            `ConvTranspose1d weight loads quantized and this parameter holds ${p.shape.dtype}`,
+        );
+      }
+      if (t.shape.join() !== p.shape.dims!.join()) {
+        throw new RunntimeError(
+          'CHECKPOINT_MISMATCH',
+          `loadStateDict: '${name}' quantized shape [${t.shape}] != model [${p.shape.dims}]`,
+        );
+      }
+      p.bindQuantizedData({
+        ints: await t.ints(),
+        scales: await t.scales(),
+        offsets: t.offsets ? await t.offsets() : undefined,
+        groupSize: t.groupSize,
+      });
     } else {
-      const data = await materialize(name, t, p.shape.dtype);
-      p.bind(upload(p.preprocess ? p.preprocess(data) : data, p.shape));
+      const numel = t.shape.reduce((a, b) => a * b, 1);
+      // A quantW slot counts u32 words under logical dims. Privacy-filter's
+      // pre-packed U32 file tensors count words too; anything else, like
+      // Linear's packed weight, counts logical values.
+      const words = p.shape.dtype === 'quantW' && t.kind === 'file' && t.dtype === 'U32';
+      const expected =
+        p.shape.dtype === 'quantW' && !words
+          ? p.shape.dims!.reduce((a, b) => a * b, 1)
+          : p.shape.elems;
+      if (numel !== expected) {
+        throw new RunntimeError(
+          'CHECKPOINT_MISMATCH',
+          `loadStateDict: '${name}' checkpoint shape [${t.shape}] (${numel} elems) != model ${JSON.stringify(p.shape.dims)} (${expected} ${words ? 'words' : 'elems'})`,
+        );
+      }
+      if (p instanceof CpuParameter) {
+        // CPU-resident. BF16 keeps its raw bits; anything else converts to f32.
+        p.bindData(t.dtype === 'BF16' ? await t.u16() : await t.f32());
+      } else {
+        const data = await materialize(name, t, p.shape.dtype);
+        p.bind(upload(p.preprocess ? p.preprocess(data) : data, p.shape));
+      }
     }
     done += t.byteLength;
     opts.onProgress?.(name, done, total);

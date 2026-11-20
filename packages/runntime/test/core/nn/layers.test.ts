@@ -1145,6 +1145,43 @@ describe('Embedding', () => {
       expect(upload).not.toHaveBeenCalled();
       expect(e.gather([1, 0])).toEqual(new Float32Array([10, 12, -1.75, 1.75, 0.5, -1, 3, -4]));
     });
+
+    describe('with per-group offsets', () => {
+      // [2, 4] in groups of 4: row r is int · scale[r] + offset[r]
+      const withOffsets = (): LazyStateDict => ({
+        metadata: {},
+        tensors: new Map([
+          [
+            'weight',
+            quantTensor({
+              name: 'weight',
+              shape: [2, 4],
+              bits: 4,
+              groupSize: 4,
+              byteLength: 0,
+              sources: [],
+              ints: async () => new Int8Array([1, -2, 3, -4, 5, 6, -7, 7]),
+              scales: async () => new Float32Array([0.5, 2]),
+              offsets: async () => new Float32Array([10, 20]),
+            }),
+          ],
+        ]),
+        totalBytes: () => 0,
+      });
+      const want = [10.5, 9, 11.5, 8, 30, 32, 6, 34];
+
+      it('gathers a CPU table as int · scale + offset', async () => {
+        const e = new Embedding(2, 4, { device: 'cpu' });
+        await loadLazyStateDict(e, withOffsets(), { upload: vi.fn() });
+        expect(e.gather([1, 0])).toEqual(new Float32Array([...want.slice(4), ...want.slice(0, 4)]));
+      });
+
+      it('uploads a GPU table as int · scale + offset', async () => {
+        expect(await uploadedWeight(new Embedding(2, 4), withOffsets())).toEqual(
+          new Float32Array(want),
+        );
+      });
+    });
   });
 });
 

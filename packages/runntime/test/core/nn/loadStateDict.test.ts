@@ -429,8 +429,7 @@ describe('binding', () => {
 });
 
 describe('a quantized tensor', () => {
-  // A [2, 2] int8 weight in groups of 2; the loader must refuse it before
-  // reading either part.
+  // A [2, 2] int8 tensor in groups of 2.
   const ints = vi.fn(async () => new Int8Array([1, 2, 3, 4]));
   const scales = vi.fn(async () => new Float32Array([1, 2]));
   const quant = quantTensor({
@@ -447,7 +446,6 @@ describe('a quantized tensor', () => {
   it.each([
     { name: 'an f32 parameter', param: () => new Parameter(meta([2, 2])), dtype: 'f32' },
     { name: 'an f16 parameter', param: () => new Parameter(meta([2, 2], 'f16')), dtype: 'f16' },
-    { name: 'a CpuParameter', param: () => new CpuParameter(meta([2, 2])), dtype: 'f32' },
     {
       name: 'a quantW parameter',
       param: () => new Parameter({ elems: 1, dtype: 'quantW', dims: [2, 2] }),
@@ -467,6 +465,21 @@ describe('a quantized tensor', () => {
     expect(upload).not.toHaveBeenCalled();
     expect(ints).not.toHaveBeenCalled();
     expect(scales).not.toHaveBeenCalled();
+  });
+
+  it('binds quantized data to a CPU-resident parameter', async () => {
+    class CpuTable extends Module {
+      weight = new CpuParameter(meta([2, 2]));
+    }
+    const table = new CpuTable();
+    await load(table, { weight: quant }, recorder());
+    expect(table.weight.quantizedData).toEqual({
+      ints: new Int8Array([1, 2, 3, 4]),
+      scales: new Float32Array([1, 2]),
+      offsets: undefined,
+      groupSize: 2,
+    });
+    expect(() => table.weight.data).toThrow('quantized');
   });
 });
 
