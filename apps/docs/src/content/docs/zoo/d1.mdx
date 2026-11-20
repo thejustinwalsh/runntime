@@ -1,0 +1,91 @@
+---
+title: D1 decision model
+description: Score yes/no, choice and rubric questions over text.
+---
+
+`createD1Decider` runs Liquid AI's D1 Omni 600M text decision model on WebGPU.
+It scores named options in one pass and returns their probabilities and the
+processed input token count. The public zoo loader accepts the original F32
+checkpoint or a caller-generated native Q8 checkpoint; it does not host a
+derivative weight file.
+
+## Load a local Q8 checkpoint
+
+The Q8 entry has no hosted `modelPath`. Supply a `RangeSource` that returns
+standalone byte ranges from your local or application-owned storage.
+
+```ts twoslash
+import { createD1Decider, models, type RangeSource } from 'runntime/zoo';
+
+declare const q8ModelUrl: string;
+// ---cut---
+const source: RangeSource = {
+  async read(begin, end) {
+    const response = await fetch(q8ModelUrl, {
+      headers: { Range: `bytes=${begin}-${end - 1}` },
+    });
+    if (response.status !== 206) throw new Error(`Range request returned ${response.status}`);
+    return new Uint8Array(await response.arrayBuffer());
+  },
+};
+
+const runner = await createD1Decider(
+  { ...models.d1.D1_OMNI_600M.Q8, modelPath: source },
+  { onProgress: (name, done, total) => console.log(name, done, total) },
+);
+
+const result = await runner.systemOne(
+  'The production sign-in page returns HTTP 500 for every user.',
+  {
+    team: {
+      type: 'choice',
+      instructions: 'Which team should handle this?',
+      criteria: {
+        billing: 'Charges, refunds, invoices',
+        technical: 'App or site faults',
+        fraud: 'Suspected unauthorised use',
+      },
+    },
+  },
+);
+console.log(result.answers.team, result.inputTokens);
+await runner.dispose();
+```
+
+The `RangeSource` response must contain exactly the requested bytes. If you use
+a weight cache with a `RangeSource`, set `cacheId` to a stable key for that
+artifact. The loader supports the shared zoo `LoadOptions`: progress, byte
+callbacks, abort, cache and warm-up. Warm-up runs by default; set `warmUp: false`
+to defer compilation until the first decision. Calls are serialized, and
+`dispose()` waits for queued work before releasing the model's GPU resources.
+
+## Convert the original checkpoint
+
+The converter reads the original pinned Liquid safetensors checkpoint and
+writes runntime's existing symmetric int8 format with groups of 32 input
+values. The two `--drop` patterns remove the audio and vision weights. The
+converter's default embedding exclusions and dimension checks keep the token
+embedding and the width-one scorer in their supported float formats.
+
+```sh
+curl -L --fail \
+  'https://huggingface.co/LiquidAI/d1-omni-600M/resolve/02b55d7076f15129e59ab3f94783f32c4b088674/model.safetensors' \
+  -o model.safetensors
+cd tools/python
+uv sync
+uv run runntime quantize ../model.safetensors ../d1-omni-600m-text-q8.safetensors \
+  --bits 8 --group-size 32 --drop 'audio.*' --drop 'vision.*'
+shasum -a 256 ../d1-omni-600m-text-q8.safetensors
+```
+
+Keep the source revision, source and output SHA-256 digests, converter revision,
+quantization metadata and parity measurements with your build record. The
+public model entry pins the matching tokenizer and calibration temperatures.
+
+## License and attribution
+
+The D1 weights are © Liquid AI, Inc. and licensed under the
+[LFM Open License v1.0](https://huggingface.co/LiquidAI/d1-omni-600M/blob/02b55d7076f15129e59ab3f94783f32c4b088674/LICENSE).
+Its commercial-use threshold and other terms apply to locally converted
+derivatives. This package's MIT license covers the runtime code, not D1 model
+weights. ruNNtime does not redistribute the original or converted weights.
