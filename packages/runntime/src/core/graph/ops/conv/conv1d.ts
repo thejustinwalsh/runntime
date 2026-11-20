@@ -142,6 +142,58 @@ export function conv1d(
   );
 }
 
+/** Depthwise 1-D convolution: channel c of `x` [T, C] is correlated with its
+ *  own kernel row `w[c]` of the channel-major weights [C, K], with no mixing
+ *  across channels. Both are f32 or both f16, accumulation is f32.
+ *
+ *  `padLeft` and `padRight` (default 0, each below `kernelSize`) add zero rows
+ *  before and after `x`. Returns [T + padLeft + padRight - K + 1, C] in the
+ *  input's dtype. Throws when `w` is not [C, kernelSize], the dtypes differ or
+ *  the padded length is shorter than `kernelSize`. */
+export function depthwiseConv1d(
+  x: Value,
+  w: Value,
+  opts: { kernelSize: number; padLeft?: number; padRight?: number },
+): Value {
+  const { kernelSize } = opts;
+  const padLeft = opts.padLeft ?? 0;
+  const padRight = opts.padRight ?? 0;
+  const [tIn, channels, dtype] = want2d('depthwiseConv1d', x, FLOAT_DTYPES);
+  const [weightChannels, weightKernel, weightDtype] = want2d('depthwiseConv1d.w', w, FLOAT_DTYPES);
+  if (weightDtype !== dtype) {
+    throw new Error(`depthwiseConv1d: weight dtype ${weightDtype} must match the input's ${dtype}`);
+  }
+  if (!Number.isInteger(kernelSize) || kernelSize < 1) {
+    throw new Error(`depthwiseConv1d: kernelSize ${kernelSize} must be a positive integer`);
+  }
+  for (const [name, pad] of [
+    ['padLeft', padLeft],
+    ['padRight', padRight],
+  ] as const) {
+    if (!Number.isInteger(pad) || pad < 0 || pad >= kernelSize) {
+      throw new Error(`depthwiseConv1d: ${name} ${pad} must be in [0, ${kernelSize})`);
+    }
+  }
+  if (weightChannels !== channels || weightKernel !== kernelSize) {
+    throw new Error(
+      `depthwiseConv1d: weight shape [${weightChannels}, ${weightKernel}] must be [${channels}, ${kernelSize}]`,
+    );
+  }
+  if (tIn + padLeft + padRight < kernelSize) {
+    throw new Error(
+      `depthwiseConv1d: padded frames ${tIn + padLeft + padRight} < kernelSize ${kernelSize}`,
+    );
+  }
+  const tOut = tIn + padLeft + padRight - kernelSize + 1;
+  return pending(
+    { elems: tOut * channels, dtype, dims: [tOut, channels] },
+    'depthwiseConv1d',
+    [x, w],
+    undefined,
+    [kernelSize, padLeft],
+  );
+}
+
 /** Throws unless `scales` hold one scale per groupSize values of each torch
  *  row of a quantW conv1d weight, as conv1d describes. */
 function checkQuantScales(

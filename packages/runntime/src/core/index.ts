@@ -50,6 +50,7 @@ export {
   chunk,
   clamp,
   conv1d,
+  depthwiseConv1d,
   conv2d,
   convTranspose2d,
   elu,
