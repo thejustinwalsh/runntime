@@ -22,6 +22,7 @@ const ELEMENTWISE = 0;
 const ROW = 1;
 const COLUMN = 2;
 const SCALAR = 3;
+const REPEATED_COLUMNS = 4;
 
 describe('add / mul broadcasting', () => {
   describe.each([
@@ -45,6 +46,12 @@ describe('add / mul broadcasting', () => {
     // [3] and [3, 1] both hold 3 values; only dims say which way they go
     expect(add(input([3, 3]), input([3])).pending?.attrs).toEqual([ROW]);
     expect(add(input([3, 3]), input([3, 1])).pending?.attrs).toEqual([COLUMN]);
+  });
+
+  it('repeats each [M, groups] value across an equal-width column block', () => {
+    const c = mul(input([2, 12]), input([2, 3]));
+    expect(c.shape).toEqual(meta([2, 12]));
+    expect(c.pending).toMatchObject({ op: 'mul', attrs: [REPEATED_COLUMNS, 4] });
   });
 
   it('puts the full operand first whichever side it is on', () => {

@@ -11,7 +11,7 @@ import { cachedBindGroup, cachedUniform } from '../../gpu/dispatchCache.ts';
 import { clampedSwiglu } from '../activations.ts';
 import { type Elem, F32_ELEM } from '../elem.ts';
 
-const Meta = d.struct({ total: d.u32, cols: d.u32, mode: d.u32 });
+const Meta = d.struct({ total: d.u32, cols: d.u32, mode: d.u32, repeat: d.u32 });
 
 function makeVariant(elem: Elem) {
   const f16 = elem.key === 'f16';
@@ -30,6 +30,11 @@ function makeVariant(elem: Elem) {
     if (m === 1) return i % cols; // row broadcast
     if (m === 2) return std.intdiv(i, cols); // col broadcast, u32 division: f32 / rounds past 2^24
     if (m === 3) return 0; // scalar broadcast (GPU-computed [1,1])
+    if (m === 4) {
+      const row = std.intdiv(i, cols);
+      const col = i % cols;
+      return row * std.intdiv(cols, layout.$.meta.repeat) + std.intdiv(col, layout.$.meta.repeat);
+    }
     return i; // elementwise
   };
 
@@ -122,10 +127,11 @@ export function elementwiseF32Handle(
   total: number,
   cols: number,
   mode: number,
+  repeat: number,
   buffers: { a: FloatBuffer; b: FloatBuffer; out: FloatBuffer },
   elem: Elem = F32_ELEM,
 ): KernelHandle {
-  const meta = cachedUniform(root, Meta, { total, cols, mode });
+  const meta = cachedUniform(root, Meta, { total, cols, mode, repeat });
   const bindGroup = cachedBindGroup(root, elementwiseVariant(elem).layout, { ...buffers, meta });
   return makeHandle(pipeline, name, bindGroup, Math.ceil(total / WORKGROUP_SIZE));
 }

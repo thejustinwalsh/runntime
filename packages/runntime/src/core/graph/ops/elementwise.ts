@@ -10,14 +10,21 @@ function dimsMatch(a?: readonly number[], b?: readonly number[]): boolean {
 }
 
 /** Describes how `a op b` broadcasts, or null if the pair is incompatible.
- *  `mode` is 0 elementwise, 1 row, 2 column, 3 scalar.
+ *  `mode` is 0 elementwise, 1 row, 2 column, 3 scalar, 4 repeated column
+ *  groups (one value scales each consecutive block of columns).
  *
  *  Decided from dims where available: element counts alone cannot tell [M,1]
  *  from [N] on a square matrix. */
 function broadcastPlan(
   x: Value,
   y: Value,
-): { full: Value; other: Value; shape: ValueMeta; mode: 0 | 1 | 2 | 3 } | null {
+): {
+  full: Value;
+  other: Value;
+  shape: ValueMeta;
+  mode: 0 | 1 | 2 | 3 | 4;
+  repeat: number;
+} | null {
   if (x.shape.dtype !== y.shape.dtype) return null;
   // hwc4 and chw can share an element count with different byte order, and
   // pairing them would silently mix pixels.
@@ -30,29 +37,38 @@ function broadcastPlan(
     // PyTorch, so [N] pairs with [1,N] but not with [N,1].
     const squeeze = (d: readonly number[]) => d.slice(d.findIndex((v) => v !== 1));
     if (xd && yd && !dimsMatch(squeeze(xd), squeeze(yd))) return null;
-    return { full: x, other: y, shape: { ...x.shape }, mode: 0 };
+    return { full: x, other: y, shape: { ...x.shape }, mode: 0, repeat: 0 };
   }
   // Broadcasting is row-major arithmetic, so it never applies to hwc4.
   if (x.shape.layout !== undefined) return null;
   const full = x.shape.elems > y.shape.elems ? x : y;
   const other = full === x ? y : x;
-  if (other.shape.elems === 1) return { full, other, shape: { ...full.shape }, mode: 3 };
+  if (other.shape.elems === 1) return { full, other, shape: { ...full.shape }, mode: 3, repeat: 0 };
   const fd = full.shape.dims;
   if (!fd || fd.length !== 2) return null;
   const [m, n] = [fd[0]!, fd[1]!];
   const od = other.shape.dims;
   if (od) {
     if (od.length === 2 && od[0] === m && od[1] === 1) {
-      return { full, other, shape: { ...full.shape }, mode: 2 }; // col [M,1]
+      return { full, other, shape: { ...full.shape }, mode: 2, repeat: 0 }; // col [M,1]
     }
     if ((od.length === 1 && od[0] === n) || (od.length === 2 && od[0] === 1 && od[1] === n)) {
-      return { full, other, shape: { ...full.shape }, mode: 1 }; // row [N]/[1,N]
+      return { full, other, shape: { ...full.shape }, mode: 1, repeat: 0 }; // row [N]/[1,N]
+    }
+    if (od.length === 2 && od[0] === m && od[1]! > 1 && od[1]! < n && n % od[1]! === 0) {
+      return {
+        full,
+        other,
+        shape: { ...full.shape },
+        mode: 4,
+        repeat: n / od[1]!,
+      };
     }
     return null;
   }
   // Fallback for values without dims: infer from element counts.
-  if (other.shape.elems === n) return { full, other, shape: { ...full.shape }, mode: 1 }; // row [N]
-  if (other.shape.elems === m) return { full, other, shape: { ...full.shape }, mode: 2 }; // col [M]/[M,1]
+  if (other.shape.elems === n) return { full, other, shape: { ...full.shape }, mode: 1, repeat: 0 }; // row [N]
+  if (other.shape.elems === m) return { full, other, shape: { ...full.shape }, mode: 2, repeat: 0 }; // col [M]/[M,1]
   return null;
 }
 
@@ -71,7 +87,13 @@ function elementwise(name: 'add' | 'sub' | 'mul' | 'swiglu', a: Value, b: Value)
       `${name}: incompatible shapes — a=(${a.shape.elems},${a.shape.dtype}) b=(${b.shape.elems},${b.shape.dtype})`,
     );
   }
-  return pending(plan.shape, name, [plan.full, plan.other], undefined, [plan.mode]);
+  return pending(
+    plan.shape,
+    name,
+    [plan.full, plan.other],
+    undefined,
+    plan.mode === 4 ? [plan.mode, plan.repeat] : [plan.mode],
+  );
 }
 
 /** Elementwise add. A number `b` folds into the dispatch with no upload. */

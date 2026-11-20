@@ -35,7 +35,7 @@ function binarySpec(
   factory: (root: TgpuRoot, elem: Elem) => ReturnType<typeof createAddF32Pipeline>,
 ) {
   return defineSpec({
-    attrs: (p) => ({ mode: p.attrs![0]! }),
+    attrs: (p) => ({ mode: p.attrs![0]!, repeat: p.attrs![1] ?? 0 }),
     cfg: () => undefined,
     pipeline: (root, dtype) => factory(root, elemFor(dtype)),
     encode: ({ node, attrs, pipeline, inputs, out, ctx }) => {
@@ -49,6 +49,7 @@ function binarySpec(
           node.shape.elems,
           cols,
           attrs.mode,
+          attrs.repeat,
           {
             a: narrowFloat(inputs[0]!, dtype),
             b: narrowFloat(inputs[1]!, dtype),
