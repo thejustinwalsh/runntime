@@ -17,6 +17,8 @@ import type { ObjectDetectorModel } from './tasks/cv/objectDetection.ts';
 import type { KeypointDetectorModel } from './tasks/cv/keypointDetection.ts';
 import type { EmbedderModel } from './tasks/multimodal/embedding.ts';
 import type { PrivacyFilterModel } from './tasks/nlp/privacyFilter.ts';
+import type { Lfm3ChatModel } from './tasks/nlp/lfm3.ts';
+import { LFM3_Q4_K_M_SOURCE } from './lfm3/gguf.ts';
 
 const HUB = 'https://huggingface.co/software-mansion';
 
@@ -117,7 +119,26 @@ const REVERB_INT4 = reverb('runntime/int4');
 const DEPTHART_S = { modelPath: weights('depthart', 's', 'f16') } satisfies DepthEstimatorModel;
 const DEPTHART_B = { modelPath: weights('depthart', 'b', 'f16') } satisfies DepthEstimatorModel;
 
+const LFM3_REVISION = '21d75123f86c1f7ffb4bef1ea202710c4e7ebe67';
+const LFM3_OMNI_2B = {
+  modelPath: `https://huggingface.co/LiquidAI/LFM3-Omni-2B/resolve/${LFM3_REVISION}/model.safetensors`,
+  tokenizerPath: `https://huggingface.co/LiquidAI/LFM3-Omni-2B/resolve/${LFM3_REVISION}/tokenizer.json`,
+} satisfies Lfm3ChatModel;
+const LFM3_OMNI_2B_Q4_K_M = {
+  format: 'gguf',
+  modelPath: LFM3_Q4_K_M_SOURCE.url,
+  tokenizerPath: LFM3_OMNI_2B.tokenizerPath,
+} satisfies Lfm3ChatModel;
+
 export const models = {
+  lfm3: {
+    /** Liquid LFM3-Omni 2B text backbones. DEFAULT remains the original BF16 weights. */
+    LFM3_OMNI_2B: {
+      DEFAULT: LFM3_OMNI_2B,
+      /** Published Liquid Q4_K_M GGUF; uses the pinned tokenizer without loading floating weights. */
+      Q4_K_M: LFM3_OMNI_2B_Q4_K_M,
+    },
+  },
   embedding: {
     /** Google's EmbeddingGemma 2: text in 100+ languages and code, images
      *  and video in one 768-dim space, inputs up to 2048 tokens. 270M

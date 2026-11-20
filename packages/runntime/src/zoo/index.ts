@@ -43,6 +43,15 @@ export {
   type PrivacyFilterModel,
   type PrivacySpan,
 } from './tasks/nlp/privacyFilter.ts';
+export {
+  createLfm3Chat,
+  type Lfm3ChatModel,
+  type Lfm3ChatOptions,
+  type Lfm3ChatSession,
+  type Lfm3Generation,
+  type Lfm3GenerationResult,
+  type Lfm3Message,
+} from './tasks/nlp/lfm3.ts';
 
 export {
   createSpeechToText,
