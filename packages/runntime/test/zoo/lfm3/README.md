@@ -24,6 +24,7 @@ pnpm test:audio                                   # the four modes below, one JS
 pnpm test:audio --mode audio-roundtrip            # one mode
 pnpm test:audio --mode audio-roundtrip --voices american-female --seeds 1234,7 --out result.json
 pnpm test:audio --mode audio-liquid-reference     # against the pinned Liquid engine, named only
+pnpm test:audio --mode audio-liquid-roundtrip     # Liquid's own speech round trip, the baseline for ours
 ```
 
 The script hashes the weights, runs each mode in headless Chromium, and prints JSON: per-test status
@@ -38,6 +39,7 @@ left the page's origin (the page's `fetch` and `XMLHttpRequest` refuse other ori
 | `audio-input`            | Padded-graph boundaries, the 32 s maximum and one sample more, silence and very short clips, `resampleAudio` and `decodeAudio` at 24 and 48 kHz, a spoken question answered through `transcribe` and `generate`. |
 | `audio-memory`           | GPU bytes over twelve repeated speak and transcribe cycles, and no storage buffer left after `dispose`.                                                                                                          |
 | `audio-liquid-reference` | The audio encoder, the depth decoder's codes and one codec frame against Liquid's engine on the same inputs.                                                                                                     |
+| `audio-liquid-roundtrip` | Liquid's own transcription of the frozen clips and its speech recovered by its own transcriber: the baseline the native round trip is read against.                                                              |
 
 `speak` is seeded, so the speech inputs are produced by the model itself: no recorded audio is stored.
 `audio-liquid-reference` needs two frozen 16 kHz clips; the script regenerates them on macOS with

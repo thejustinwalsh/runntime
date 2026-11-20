@@ -26,7 +26,7 @@ import {
   sine,
 } from './audio/qualification/signals.ts';
 import { MEMORY_LIMITS, WER_LIMITS } from './audio/qualification/thresholds.ts';
-import { wordErrorRate } from './audio/qualification/wer.ts';
+import { normalizeWords, wordErrorRate } from './audio/qualification/wer.ts';
 
 let loaded: LoadedAudio;
 
@@ -156,6 +156,24 @@ describe.skipIf(MODE !== 'audio-streaming')('speech streaming, cancellation and 
     expect(result.finishReason).toBe('length');
     expect(result.audioFrames).toBe(3);
   }, 120_000);
+
+  it('reports a text longer than the frame budget as length, not as a finished utterance', async () => {
+    const text = SENTENCES.join(' ');
+    const generation = loaded.audio.speak(text, { seed: STREAM_SEED });
+    for await (const chunk of generation) expect(chunk.length).toBeGreaterThan(0);
+    const result = await generation.result;
+    const heard = await loaded.audio.transcribe(await resampleAudio(result.samples, 24_000));
+    report('streaming-frame-budget', {
+      finishReason: result.finishReason,
+      audioFrames: result.audioFrames,
+      seconds: round(result.samples.length / 24_000, 2),
+      wordsSpoken: normalizeWords(heard).length,
+      wordsRequested: normalizeWords(text).length,
+    });
+    expect(result.audioFrames).toBeLessThanOrEqual(256);
+    expect(result.finishReason).toBe('length');
+    expect(result.audioFrames).toBe(256);
+  }, 600_000);
 
   it('cancels on an early break, frees its buffers and the next speech is unchanged', async () => {
     const reference = await speakAll(FOX);

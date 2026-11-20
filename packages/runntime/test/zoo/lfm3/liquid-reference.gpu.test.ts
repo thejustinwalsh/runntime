@@ -108,10 +108,13 @@ declare global {
 }
 
 const MODE = import.meta.env.VITE_LFM3_QUALIFICATION_MODE;
-const ENGINE_URL = import.meta.env.VITE_LFM3_LIQUID_ENGINE_URL;
-const LIQUID_MODEL_URL = import.meta.env.VITE_LFM3_LIQUID_MODEL_URL;
-const LIQUID_PROJECTOR_URL = import.meta.env.VITE_LFM3_LIQUID_PROJECTOR_URL;
-const AUDIO_INPUT_BASE_URL = import.meta.env.VITE_LFM3_LIQUID_AUDIO_INPUT_BASE_URL;
+// The engine resolves a bare path against the model's directory, so every URL is made absolute.
+const absolute = (url: string | undefined): string | undefined =>
+  url === undefined ? undefined : new URL(url, location.href).href;
+const ENGINE_URL = absolute(import.meta.env.VITE_LFM3_LIQUID_ENGINE_URL);
+const LIQUID_MODEL_URL = absolute(import.meta.env.VITE_LFM3_LIQUID_MODEL_URL);
+const LIQUID_PROJECTOR_URL = absolute(import.meta.env.VITE_LFM3_LIQUID_PROJECTOR_URL);
+const AUDIO_INPUT_BASE_URL = absolute(import.meta.env.VITE_LFM3_LIQUID_AUDIO_INPUT_BASE_URL);
 const AUDIO_CAPTURE = import.meta.env.VITE_LFM3_LIQUID_AUDIO_CAPTURE === '1';
 const LEVEL_DIAGNOSTIC = import.meta.env.VITE_LFM3_LIQUID_LEVEL_DIAGNOSTIC === '1';
 const NATIVE_SPEECH_URL = import.meta.env.VITE_LFM3_NATIVE_SPEECH_URL;

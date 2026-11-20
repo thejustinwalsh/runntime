@@ -1,7 +1,8 @@
 /** Runs the audio qualification from local weights and prints one JSON result.
  *  Usage: node test/zoo/lfm3/audio-qualification.mjs [--mode <name>]... [--voices a,b] [--seeds 1,2] [--out file]
  *  Modes: audio-roundtrip, audio-streaming, audio-input, audio-memory (default: these four) and
- *  audio-liquid-reference, which compares against the pinned Liquid engine and runs only when named.
+ *  two modes against the pinned Liquid engine that run only when named: audio-liquid-reference
+ *  (encoder, depth codes, codec PCM) and audio-liquid-roundtrip (the engine's own speech round trip).
  *  Run from packages/runntime. Exits non-zero when any mode fails or a request would leave the machine. */
 
 import { spawnSync } from 'node:child_process';
@@ -20,7 +21,8 @@ import { join } from 'node:path';
 import { parseArgs } from 'node:util';
 
 const DEFAULT_MODES = ['audio-roundtrip', 'audio-streaming', 'audio-input', 'audio-memory'];
-const MODES = [...DEFAULT_MODES, 'audio-liquid-reference'];
+const LIQUID_MODES = ['audio-liquid-reference', 'audio-liquid-roundtrip'];
+const MODES = [...DEFAULT_MODES, ...LIQUID_MODES];
 const LIQUID_ENGINE = {
   file: 'lfm3-engine.js',
   instrumentedFile: 'lfm3-engine-instrumented.js',
@@ -51,6 +53,7 @@ const WEIGHTS = {
 const MARKER = 'LFM3_AUDIO_QUALIFICATION ';
 // The Liquid comparison test prints its own line; it is carried under the name `operator-reference`.
 const OPERATOR_MARKER = 'LFM3_AUDIO_OPERATOR_REFERENCE ';
+const LIQUID_MARKER = 'LFM3_LIQUID_AUDIO_REFERENCE ';
 
 const { values } = parseArgs({
   options: {
@@ -136,7 +139,9 @@ async function prepareLiquid() {
     clips: FROZEN_CLIPS,
   };
 }
-const liquidInputs = modes.includes('audio-liquid-reference') ? await prepareLiquid() : undefined;
+const liquidInputs = modes.some((mode) => LIQUID_MODES.includes(mode))
+  ? await prepareLiquid()
+  : undefined;
 
 const results = [];
 for (const mode of modes) {
@@ -151,7 +156,7 @@ for (const mode of modes) {
       'run',
       '--project',
       'gpu',
-      mode === 'audio-liquid-reference'
+      LIQUID_MODES.includes(mode)
         ? 'test/zoo/lfm3/audio-liquid-reference.gpu.test.ts'
         : 'test/zoo/lfm3/audio-qualification.gpu.test.ts',
       '--reporter=default',
@@ -163,7 +168,10 @@ for (const mode of modes) {
       maxBuffer: 1 << 28,
       env: {
         ...process.env,
-        VITE_LFM3_QUALIFICATION_MODE: mode === 'audio-liquid-reference' ? 'liquid-reference' : mode,
+        VITE_LFM3_QUALIFICATION_MODE: LIQUID_MODES.includes(mode) ? 'liquid-reference' : mode,
+        VITE_LFM3_LIQUID_TEST:
+          mode === 'audio-liquid-roundtrip' ? 'liquid-reference' : 'audio-reference',
+        VITE_LFM3_LIQUID_AUDIO_CAPTURE: '1',
         VITE_LFM3_LIQUID_ENGINE_URL: `/test/.weights/${LIQUID_ENGINE.instrumentedFile}`,
         VITE_LFM3_LIQUID_MODEL_URL: `/test/.weights/${WEIGHTS.model}`,
         VITE_LFM3_LIQUID_PROJECTOR_URL: `/test/.weights/${WEIGHTS.projector}`,
@@ -181,6 +189,13 @@ for (const mode of modes) {
   for (const line of log.split('\n')) {
     const at = line.indexOf(MARKER);
     if (at >= 0) reports.push(JSON.parse(line.slice(at + MARKER.length)));
+    const liquid = line.indexOf(LIQUID_MARKER);
+    if (liquid >= 0) {
+      reports.push({
+        name: 'liquid-round-trip',
+        cases: JSON.parse(line.slice(liquid + LIQUID_MARKER.length)),
+      });
+    }
     const operator = line.indexOf(OPERATOR_MARKER);
     if (operator >= 0) {
       reports.push({

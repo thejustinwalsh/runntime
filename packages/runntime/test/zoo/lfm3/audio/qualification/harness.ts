@@ -17,6 +17,7 @@ declare global {
     readonly VITE_LFM3_TOKENIZER_URL?: string;
     readonly VITE_LFM3_AUDIO_SEEDS?: string;
     readonly VITE_LFM3_AUDIO_VOICES?: string;
+    readonly VITE_LFM3_LIQUID_TEST?: string;
   }
   interface ImportMeta {
     readonly env: ImportMetaEnv;
