@@ -27,7 +27,8 @@ export function checkBindable(root: TgpuRoot, bytes: number, what: string): void
       'UNSUPPORTED_DEVICE',
       `${what}: ${(bytes / 1e6).toFixed(1)} MB exceeds this device's ` +
         `maxStorageBufferBindingSize of ${(cap / 1e6).toFixed(1)} MB — no shader can bind it. ` +
-        'Halve the model (nn.Module.half()) or use a quantized weight format.',
+        'If the adapter supports more, create the device with requiredLimits from bufferLimits(). ' +
+        'Otherwise halve the model (nn.Module.half()) or use a quantized weight format.',
     );
   }
 }

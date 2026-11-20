@@ -124,6 +124,7 @@ export {
 } from './gpu/replayCache.ts';
 export type { GpuOpTime, GpuPerfSink, GpuSubmitTiming } from './gpu/perf.ts';
 export { defaultRoot, resetRunntime, supportsF16 } from './gpu/context.ts';
+export { bufferLimits, type BufferLimits } from './gpu/limits.ts';
 export { inGpuErrorScopes, warmUp } from './gpu/errorScopes.ts';
 export {
   RUNNTIME_ERROR_CODES,
