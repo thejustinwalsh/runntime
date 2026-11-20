@@ -10,6 +10,7 @@ declare global {
     readonly VITE_LFM3_AUDIO_INPUT_BASE_URL?: string;
     readonly VITE_LFM3_MODEL_URL?: string;
     readonly VITE_LFM3_PROJECTOR_URL?: string;
+    readonly VITE_LFM3_TOKENIZER_URL?: string;
     readonly VITE_LFM3_NATIVE_AUDIO_CAPTURE?: string;
   }
   interface ImportMeta {
@@ -126,6 +127,9 @@ it.skipIf(MODE !== 'audio')(
           : {}),
         ...(import.meta.env.VITE_LFM3_PROJECTOR_URL
           ? { projectorPath: import.meta.env.VITE_LFM3_PROJECTOR_URL }
+          : {}),
+        ...(import.meta.env.VITE_LFM3_TOKENIZER_URL
+          ? { tokenizerPath: import.meta.env.VITE_LFM3_TOKENIZER_URL }
           : {}),
       },
       {

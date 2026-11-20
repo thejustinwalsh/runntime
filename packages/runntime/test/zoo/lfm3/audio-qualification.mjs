@@ -1,8 +1,9 @@
 /** Runs the audio qualification from local weights and prints one JSON result.
  *  Usage: node test/zoo/lfm3/audio-qualification.mjs [--mode <name>]... [--voices a,b] [--seeds 1,2] [--out file]
  *  Modes: audio-roundtrip, audio-streaming, audio-input, audio-memory (default: these four) and
- *  two modes against the pinned Liquid engine that run only when named: audio-liquid-reference
- *  (encoder, depth codes, codec PCM) and audio-liquid-roundtrip (the engine's own speech round trip).
+ *  three modes that run only when named: audio-liquid-reference
+ *  (encoder, depth codes, codec PCM against Liquid's engine), audio-liquid-roundtrip (the engine's own
+ *  speech round trip) and audio-public (the public runner on the frozen clips).
  *  Run from packages/runntime. Exits non-zero when any mode fails or a request would leave the machine. */
 
 import { spawnSync } from 'node:child_process';
@@ -22,7 +23,8 @@ import { parseArgs } from 'node:util';
 
 const DEFAULT_MODES = ['audio-roundtrip', 'audio-streaming', 'audio-input', 'audio-memory'];
 const LIQUID_MODES = ['audio-liquid-reference', 'audio-liquid-roundtrip'];
-const MODES = [...DEFAULT_MODES, ...LIQUID_MODES];
+const GUARDED_MODES = [...LIQUID_MODES, 'audio-public'];
+const MODES = [...DEFAULT_MODES, ...GUARDED_MODES];
 const LIQUID_ENGINE = {
   file: 'lfm3-engine.js',
   instrumentedFile: 'lfm3-engine-instrumented.js',
@@ -139,7 +141,7 @@ async function prepareLiquid() {
     clips: FROZEN_CLIPS,
   };
 }
-const liquidInputs = modes.some((mode) => LIQUID_MODES.includes(mode))
+const liquidInputs = modes.some((mode) => GUARDED_MODES.includes(mode))
   ? await prepareLiquid()
   : undefined;
 
@@ -156,8 +158,8 @@ for (const mode of modes) {
       'run',
       '--project',
       'gpu',
-      LIQUID_MODES.includes(mode)
-        ? 'test/zoo/lfm3/audio-liquid-reference.gpu.test.ts'
+      GUARDED_MODES.includes(mode)
+        ? 'test/zoo/lfm3/audio-guarded.gpu.test.ts'
         : 'test/zoo/lfm3/audio-qualification.gpu.test.ts',
       '--reporter=default',
       '--reporter=json',
@@ -168,9 +170,18 @@ for (const mode of modes) {
       maxBuffer: 1 << 28,
       env: {
         ...process.env,
-        VITE_LFM3_QUALIFICATION_MODE: LIQUID_MODES.includes(mode) ? 'liquid-reference' : mode,
-        VITE_LFM3_LIQUID_TEST:
-          mode === 'audio-liquid-roundtrip' ? 'liquid-reference' : 'audio-reference',
+        VITE_LFM3_QUALIFICATION_MODE: LIQUID_MODES.includes(mode)
+          ? 'liquid-reference'
+          : mode === 'audio-public'
+            ? 'audio'
+            : mode,
+        VITE_LFM3_GUARDED_TEST:
+          mode === 'audio-liquid-roundtrip'
+            ? 'liquid-reference'
+            : mode === 'audio-public'
+              ? 'public-audio'
+              : 'audio-reference',
+        VITE_LFM3_AUDIO_INPUT_BASE_URL: '/test/.weights/audio-fixtures',
         VITE_LFM3_LIQUID_AUDIO_CAPTURE: '1',
         VITE_LFM3_LIQUID_ENGINE_URL: `/test/.weights/${LIQUID_ENGINE.instrumentedFile}`,
         VITE_LFM3_LIQUID_MODEL_URL: `/test/.weights/${WEIGHTS.model}`,
