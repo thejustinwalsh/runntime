@@ -49,6 +49,7 @@ import {
   type Lfm3DepthSamplingSettings,
 } from '../../lfm3/audio/sampling.ts';
 import { LFM3_Q4_K_M_SOURCE, LFM3_Q8_0_PROJECTOR_SOURCE } from '../../lfm3/gguf.ts';
+import { createLfm3Session, type Lfm3ChatSession } from '../../lfm3/session.ts';
 import type { Lfm3Backbone, Lfm3ChatModel } from '../nlp/lfm3.ts';
 import { loadLfm3Backbone } from '../nlp/lfm3.ts';
 
@@ -100,6 +101,8 @@ export interface Lfm3Audio {
       readonly url: string | null;
     };
   };
+  /** Generates text from the shared language backbone. */
+  generate: Lfm3ChatSession['generate'];
   /** Transcribes bounded mono PCM at 16 kHz. */
   transcribe(audio: Float32Array, options?: Lfm3TranscriptionOptions): Promise<string>;
   /** Generates 24 kHz mono PCM, yielding stable sample chunks as codec frames arrive. */
@@ -126,10 +129,10 @@ interface AudioCodecStep {
   readonly cache: Lfm3AudioDecoderCache;
 }
 
-class AudioQueue implements AsyncIterableIterator<Float32Array> {
-  private readonly values: Float32Array[] = [];
+class OutputQueue<T extends string | Float32Array> implements AsyncIterableIterator<T> {
+  private readonly values: T[] = [];
   private readonly waiters: {
-    resolve(result: IteratorResult<Float32Array>): void;
+    resolve(result: IteratorResult<T>): void;
     reject(error: unknown): void;
   }[] = [];
   private ended = false;
@@ -137,11 +140,11 @@ class AudioQueue implements AsyncIterableIterator<Float32Array> {
 
   constructor(private readonly cancel: () => void) {}
 
-  [Symbol.asyncIterator](): AsyncIterableIterator<Float32Array> {
+  [Symbol.asyncIterator](): AsyncIterableIterator<T> {
     return this;
   }
 
-  next(): Promise<IteratorResult<Float32Array>> {
+  next(): Promise<IteratorResult<T>> {
     const value = this.values.shift();
     if (value) return Promise.resolve({ done: false, value });
     if (this.failure !== undefined) return Promise.reject(this.failure);
@@ -149,13 +152,13 @@ class AudioQueue implements AsyncIterableIterator<Float32Array> {
     return new Promise((resolve, reject) => this.waiters.push({ resolve, reject }));
   }
 
-  return(): Promise<IteratorResult<Float32Array>> {
+  return(): Promise<IteratorResult<T>> {
     if (!this.ended && this.failure === undefined) this.cancel();
     this.close();
     return Promise.resolve({ done: true, value: undefined });
   }
 
-  push(value: Float32Array): void {
+  push(value: T): void {
     if (this.ended || this.failure !== undefined || value.length === 0) return;
     const waiter = this.waiters.shift();
     if (waiter) waiter.resolve({ done: false, value });
@@ -206,6 +209,7 @@ export async function createLfm3Audio(
     const root = backbone.root;
     const executor = backbone.executor;
     const liveBackbone = backbone;
+    const chat = createLfm3Session(liveBackbone.tokenizer, liveBackbone.runtime);
     audioModel = new Lfm3OmniAudioModel();
     audioModel.half(root);
     await audioModel.loadStateDict(projector.weights, {
@@ -587,6 +591,29 @@ export async function createLfm3Audio(
           url: typeof projectorPath === 'string' ? projectorPath : null,
         },
       },
+      generate(messages, options = {}) {
+        guard();
+        const linked = linkSignal(options.signal);
+        const stream = new OutputQueue<string>(() => linked.abort());
+        const result = schedule(linked, async () => {
+          const generation = chat.generate(messages, { ...options, signal: linked.signal });
+          for await (const text of generation) stream.push(text);
+          return generation.result;
+        })
+          .then(
+            (value) => {
+              stream.close();
+              return value;
+            },
+            (error: unknown) => {
+              stream.fail(error);
+              throw error;
+            },
+          )
+          .finally(linked.dispose);
+        result.catch(() => undefined);
+        return { result, cancel: () => linked.abort(), [Symbol.asyncIterator]: () => stream };
+      },
       transcribe(audio, options = {}) {
         guard();
         const linked = linkSignal(options.signal);
@@ -601,7 +628,7 @@ export async function createLfm3Audio(
         }
         validateSpeechOptions(options, depthSampling);
         const linked = linkSignal(options.signal);
-        const stream = new AudioQueue(() => linked.abort());
+        const stream = new OutputQueue<Float32Array>(() => linked.abort());
         const task = schedule(linked, () =>
           speakNow(text, options, linked.signal, (samples) => stream.push(samples)),
         );
@@ -633,7 +660,7 @@ export async function createLfm3Audio(
             try {
               liveAudioModel.dispose();
             } finally {
-              await liveBackbone.runtime.dispose();
+              await chat.dispose();
             }
           });
         }

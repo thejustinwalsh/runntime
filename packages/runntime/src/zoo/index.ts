@@ -54,7 +54,9 @@ export {
 } from './tasks/nlp/lfm3.ts';
 export {
   createLfm3Audio,
+  createLfm3Audio as createLfm3Omni,
   type Lfm3Audio,
+  type Lfm3Audio as Lfm3Omni,
   type Lfm3AudioModel,
   type Lfm3SpeechGeneration,
   type Lfm3SpeechOptions,
