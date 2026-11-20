@@ -3,6 +3,7 @@
  *  Run them through `pnpm --filter runntime test:audio`. */
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { isRunntimeError } from '../../../src/core/index.ts';
 import { decodeAudio, resampleAudio } from '../../../src/zoo/index.ts';
 import { liveBuffers } from '../../gpu.ts';
 import {
@@ -173,6 +174,28 @@ describe.skipIf(MODE !== 'audio-streaming')('speech streaming, cancellation and 
     expect(result.audioFrames).toBeLessThanOrEqual(256);
     expect(result.finishReason).toBe('length');
     expect(result.audioFrames).toBe(256);
+  }, 600_000);
+
+  it('speaks very short and unusual text or fails with a typed error, and keeps working', async () => {
+    const rows: Record<string, unknown>[] = [];
+    for (const text of ['Hi.', 'Yes', '12345', '...', 'Un café très tranquille.']) {
+      try {
+        const { result } = await speakAll(text);
+        const heard = await loaded.audio.transcribe(await resampleAudio(result.samples, 24_000));
+        rows.push({
+          text,
+          finishReason: result.finishReason,
+          frames: result.audioFrames,
+          heard,
+        });
+      } catch (error) {
+        expect(isRunntimeError(error)).toBe(true);
+        rows.push({ text, error: String(error) });
+      }
+    }
+    report('streaming-unusual-text', { rows });
+    const after = await speakAll(FOX);
+    expect(after.result.finishReason).toBe('stop');
   }, 600_000);
 
   it('cancels on an early break, frees its buffers and the next speech is unchanged', async () => {
