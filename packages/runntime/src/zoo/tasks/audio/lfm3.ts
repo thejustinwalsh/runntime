@@ -267,7 +267,12 @@ export async function createLfm3Audio(
       const run = queue.then(async () => {
         guard();
         checkAborted(linked.signal);
-        return operation();
+        try {
+          return await operation();
+        } finally {
+          // Clip and prompt lengths vary, so the pool would keep a buffer set per length seen.
+          executor.trim();
+        }
       });
       queue = run.then(
         () => undefined,

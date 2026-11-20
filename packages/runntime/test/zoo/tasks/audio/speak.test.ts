@@ -17,6 +17,7 @@ const fault = vi.hoisted(() => ({
   failNextForward: false,
   backboneLoads: 0,
   backboneDisposals: 0,
+  trims: 0,
 }));
 
 vi.mock('../../../../src/core/index.ts', async (importOriginal) => {
@@ -44,7 +45,12 @@ vi.mock('../../../../src/zoo/tasks/nlp/lfm3.ts', () => ({
     fault.backboneLoads++;
     return {
       root: { device: { queue: { onSubmittedWorkDone: async () => {} } } },
-      executor: { releaseValues() {}, trim() {} },
+      executor: {
+        releaseValues() {},
+        trim() {
+          fault.trims++;
+        },
+      },
       model: {},
       tokenizer: {
         bosId: 1,
@@ -97,8 +103,8 @@ vi.mock('../../../../src/zoo/lfm3/audio/model.ts', () => ({
   Lfm3AudioModel: class {
     half() {}
     async loadStateDict() {}
-    encodeAudio() {
-      return {};
+    encodeAudio(audio: Float32Array) {
+      return { shape: { dims: [Math.ceil(audio.length / 1280)] } };
     }
     forwardDepthFrame() {
       return Array.from({ length: 12 }, () => ({}));
@@ -240,5 +246,59 @@ describe('public audio speech stream', () => {
     } finally {
       await audio.dispose();
     }
+  });
+
+  describe('executor pool trimming', () => {
+    const open = () =>
+      createLfm3Audio({ projectorPath: { read: async () => new Uint8Array() } }, { warmUp: false });
+
+    /** Clip and prompt lengths vary, so a pool trimmed only at warm-up keeps a buffer set for
+     *  every length seen. Each queued operation must trim, however it ends. */
+    it('trims after a completed speech, a transcription, a cancelled speech and a failed speech', async () => {
+      const audio = await open();
+      try {
+        const trimmed = async (run: () => Promise<unknown>) => {
+          const before = fault.trims;
+          await run().catch(() => undefined);
+          return fault.trims - before;
+        };
+
+        const speech = audio.speak('hello world', { maxAudioFrames: 2, temperature: 0, seed: 7 });
+        expect(await trimmed(() => speech.result)).toBeGreaterThanOrEqual(1);
+
+        const transcribed = audio.transcribe(new Float32Array(16_000), { maxNewTokens: 2 });
+        expect(await trimmed(() => transcribed)).toBeGreaterThanOrEqual(1);
+
+        const cancelled = audio.speak('cancel me', { maxAudioFrames: 10, temperature: 0, seed: 7 });
+        cancelled.cancel();
+        expect(await trimmed(() => cancelled.result)).toBeGreaterThanOrEqual(0);
+        await expect(cancelled.result).rejects.toBeDefined();
+
+        fault.failNextForward = true;
+        const failed = audio.speak('injected failure', { maxAudioFrames: 1, temperature: 0 });
+        expect(await trimmed(() => failed.result)).toBeGreaterThanOrEqual(1);
+        await expect(failed.result).rejects.toMatchObject({ code: 'EXECUTION_FAILED' });
+      } finally {
+        await audio.dispose();
+      }
+    });
+
+    it('trims once per queued operation, not once per load', async () => {
+      const audio = await open();
+      try {
+        const before = fault.trims;
+        for (let index = 0; index < 3; index++) {
+          const speech = audio.speak(`clip ${index}`, {
+            maxAudioFrames: 1 + index,
+            temperature: 0,
+            seed: 7,
+          });
+          await speech.result;
+        }
+        expect(fault.trims - before).toBe(3);
+      } finally {
+        await audio.dispose();
+      }
+    });
   });
 });
