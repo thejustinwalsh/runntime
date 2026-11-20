@@ -49,6 +49,7 @@
     "test": "vitest run",
     "test:unit": "vitest run --project unit",
     "test:gpu": "vitest run --project gpu",
+    "test:audio": "node test/zoo/lfm3/audio-qualification.mjs",
     "bench:ab": "node bench/cli.ts"
   },
   "dependencies": {
