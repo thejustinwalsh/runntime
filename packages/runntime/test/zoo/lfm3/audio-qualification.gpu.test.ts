@@ -25,7 +25,7 @@ import {
   levels,
   sine,
 } from './audio/qualification/signals.ts';
-import { WER_LIMITS } from './audio/qualification/thresholds.ts';
+import { MEMORY_LIMITS, WER_LIMITS } from './audio/qualification/thresholds.ts';
 import { wordErrorRate } from './audio/qualification/wer.ts';
 
 let loaded: LoadedAudio;
@@ -408,7 +408,7 @@ describe.skipIf(MODE !== 'audio-input')(
 describe.skipIf(MODE !== 'audio-memory')('GPU memory across repeated audio runs', () => {
   useModel('audio-memory');
 
-  it('reports GPU memory across repeated runs and releases everything on dispose', async () => {
+  it('returns to the same size when the same inputs repeat and releases everything on dispose', async () => {
     const cycles = 12;
     const rows: {
       cycle: number;
@@ -442,6 +442,13 @@ describe.skipIf(MODE !== 'audio-memory')('GPU memory across repeated audio runs'
       storageBuffersAfterDispose: storage.length,
       rootCacheBytesAfterDispose: remaining.reduce((sum, buffer) => sum + buffer.size, 0),
     });
+    // The second pass over the same sentences must land where the first pass did: nothing accumulates.
+    for (const row of rows.slice(SENTENCES.length)) {
+      const first = rows[row.cycle - SENTENCES.length]!;
+      expect(Math.abs(row.gpuBytes - first.gpuBytes)).toBeLessThanOrEqual(
+        MEMORY_LIMITS.repeatSlackBytes,
+      );
+    }
     expect(storage).toEqual([]);
   }, 1_800_000);
 });

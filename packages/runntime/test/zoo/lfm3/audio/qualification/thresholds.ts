@@ -11,3 +11,11 @@ export const WER_LIMITS = {
   /** One 8-sentence clip of 29 s: 0 of 71 words wrong. Same per-item limit. */
   longWer: 2 / 7,
 } as const;
+
+/** Twelve cycles over eight sentences (clip lengths 2.2 to 4.2 s): GPU bytes sit between 1.843 and
+ *  1.886 GB, against 1.825 GB right after load, and the second pass over the same eight sentences
+ *  differs from the first by at most 6 KB. Before the pool was trimmed per call it grew from 1.97 to
+ *  2.17 GB in six cycles. */
+export const MEMORY_LIMITS = {
+  repeatSlackBytes: 64 * 1024,
+} as const;
